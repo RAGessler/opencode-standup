@@ -42,6 +42,7 @@ from pathlib import Path
 
 from textual import on
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Container, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
@@ -721,18 +722,18 @@ class StandupApp(App):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("r", "refresh_report", "Refresh"),
-        ("e", "rename", "Rename"),
-        ("x", "archive", "Archive"),
-        ("A", "toggle_archived", "Show archived"),
-        ("u", "unarchive", "Unarchive"),
-        ("o", "open_session", "Open"),
+        Binding("e", "rename", "Rename", show=False),
+        Binding("x", "archive", "Archive", show=False),
+        Binding("A", "toggle_archived", "Show archived", show=False),
+        Binding("u", "unarchive", "Unarchive", show=False),
+        Binding("o", "open_session", "Open", show=False),
         ("1", "set_scope_today", "Today"),
         ("2", "set_scope_last_workday", "Last workday"),
         ("3", "set_scope_week", "Week"),
         ("4", "set_scope_all", "All"),
-        ("[", "prev_tab", "Prev tab"),
-        ("]", "next_tab", "Next tab"),
-        ("question_mark", "show_help", "Help"),
+        Binding("[", "prev_tab", "Prev tab", show=False),
+        Binding("]", "next_tab", "Next tab", show=False),
+        Binding("question_mark", "show_help", "Help", show=False),
     ]
 
     def __init__(self, db_path: str, scope: Scope):
@@ -755,7 +756,7 @@ class StandupApp(App):
                 yield Static(id="todo-summary")
                 with VerticalScroll(id="todo-tree-container"):
                     yield Tree("open todos", id="todo-tree")
-        yield Footer()
+        yield Footer(compact=True, show_command_palette=False)
 
     def on_mount(self) -> None:
         self.title = "opencode standup"
