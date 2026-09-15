@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opencode-standup"
+version = "0.1.0"
+description = "A TUI command center for OpenCode sessions"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Ryan Gessler" }]
+dependencies = ["textual>=8.2.8,<9"]
+
+[project.scripts]
+opencode-standup = "opencode_standup.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
