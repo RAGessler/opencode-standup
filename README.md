@@ -5,6 +5,7 @@
 It provides:
 
 - A standup view grouping sessions by project for today, the last workday, this week, or all time
+- A current sprint view for September 14 through September 25, 2026
 - Cost and token rollups, including subagent spend
 - A todo view of outstanding todo items across sessions
 - Session rename, archive, unarchive, and resume actions
@@ -85,6 +86,7 @@ The default view shows sessions from the previous workday. Use the keybindings b
 ```bash
 opencode-standup
 opencode-standup --scope week
+opencode-standup --scope sprint
 opencode-standup --date 2026-09-15
 opencode-standup --days-ago 1
 opencode-standup --db /path/to/opencode.db
@@ -100,7 +102,7 @@ The command exits with an error if the configured database does not exist.
 
 In the TUI, press `?` for the full keybinding list. The primary bindings are:
 
-- `1` through `4`: change the standup time scope
+- `1` through `5`: change the standup time scope, including the current sprint
 - `[` and `]`: switch tabs
 - `e`: rename the selected session
 - `x`: archive the selected session

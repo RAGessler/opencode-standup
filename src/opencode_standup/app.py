@@ -70,6 +70,7 @@ class ScopeKind(Enum):
     TODAY = "today"
     LAST_WORKDAY = "last_workday"
     WEEK = "week"
+    SPRINT = "sprint"
     ALL = "all"
     CUSTOM = "custom"
 
@@ -78,9 +79,13 @@ SCOPE_LABELS = {
     ScopeKind.TODAY: "Today",
     ScopeKind.LAST_WORKDAY: "Last workday",
     ScopeKind.WEEK: "This week",
+    ScopeKind.SPRINT: "Current sprint",
     ScopeKind.ALL: "All time",
     ScopeKind.CUSTOM: "Custom date",
 }
+
+CURRENT_SPRINT_START = date(2026, 9, 14)
+CURRENT_SPRINT_END = date(2026, 9, 25)
 
 
 def last_workday(today: date) -> date:
@@ -121,6 +126,10 @@ class Scope:
             monday = today - timedelta(days=today.weekday())
             start_ms, _ = day_bounds_ms(monday)
             _, end_ms = day_bounds_ms(today)
+            return start_ms, end_ms
+        if self.kind == ScopeKind.SPRINT:
+            start_ms, _ = day_bounds_ms(CURRENT_SPRINT_START)
+            _, end_ms = day_bounds_ms(CURRENT_SPRINT_END)
             return start_ms, end_ms
         if self.kind == ScopeKind.CUSTOM and self.custom_date:
             return day_bounds_ms(self.custom_date)
@@ -655,6 +664,7 @@ HELP_TEXT = """\
   2          Last workday
   3          This week
   4          All time
+  5          Current sprint
 
 [b]Actions (select a task/session row first)[/b]
   o          Open/resume this session in the real opencode TUI
@@ -731,6 +741,7 @@ class StandupApp(App):
         ("2", "set_scope_last_workday", "Last workday"),
         ("3", "set_scope_week", "Week"),
         ("4", "set_scope_all", "All"),
+        ("5", "set_scope_sprint", "Sprint"),
         Binding("[", "prev_tab", "Prev tab", show=False),
         Binding("]", "next_tab", "Next tab", show=False),
         Binding("question_mark", "show_help", "Help", show=False),
@@ -939,6 +950,10 @@ class StandupApp(App):
         self.scope = Scope(ScopeKind.ALL)
         self.load_and_render()
 
+    def action_set_scope_sprint(self) -> None:
+        self.scope = Scope(ScopeKind.SPRINT)
+        self.load_and_render()
+
     # -- actions: tabs ---------------------------------------------------------
 
     def action_prev_tab(self) -> None:
@@ -1059,7 +1074,7 @@ def main() -> None:
     parser.add_argument(
         "--scope",
         dest="scope",
-        choices=["today", "last-workday", "week", "all"],
+        choices=["today", "last-workday", "week", "all", "sprint"],
         default=None,
         help="Start on a specific scope. Defaults to 'last-workday'.",
     )
@@ -1086,6 +1101,7 @@ def main() -> None:
                 "last-workday": ScopeKind.LAST_WORKDAY,
                 "week": ScopeKind.WEEK,
                 "all": ScopeKind.ALL,
+                "sprint": ScopeKind.SPRINT,
             }[args.scope]
         )
     else:
