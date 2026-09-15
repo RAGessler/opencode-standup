@@ -78,7 +78,7 @@ The launcher is always written to `~/.local/bin`.
 opencode-standup
 ```
 
-The default view shows today's sessions. Use the keybindings below to change the time range, switch to todos, refresh, or open a session.
+The default view shows sessions from the previous workday. Use the keybindings below to change the time range, switch to todos, refresh, or open a session.
 
 ## Usage
 

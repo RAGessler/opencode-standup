@@ -1060,7 +1060,7 @@ def main() -> None:
         dest="scope",
         choices=["today", "last-workday", "week", "all"],
         default=None,
-        help="Start on a specific scope. Defaults to 'today'.",
+        help="Start on a specific scope. Defaults to 'last-workday'.",
     )
     parser.add_argument(
         "--db",
@@ -1088,7 +1088,7 @@ def main() -> None:
             }[args.scope]
         )
     else:
-        scope = Scope(ScopeKind.TODAY)
+        scope = Scope(ScopeKind.LAST_WORKDAY)
 
     app = StandupApp(db_path=db_path, scope=scope)
     app.run()
