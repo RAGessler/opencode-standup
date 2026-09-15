@@ -3,10 +3,14 @@ import unittest
 from datetime import date
 from unittest.mock import patch
 
-from opencode_standup.app import Scope, ScopeKind, day_bounds_ms, main
+from opencode_standup.app import Scope, ScopeKind, day_bounds_ms, fmt_cost, main
 
 
 class MainTests(unittest.TestCase):
+    def test_costs_are_displayed_to_two_decimal_places(self) -> None:
+        self.assertEqual(fmt_cost(0.1234), "$0.12")
+        self.assertEqual(fmt_cost(1234.5678), "$1,234.57")
+
     @patch("opencode_standup.app.StandupApp.run")
     @patch("opencode_standup.app.Path.exists", return_value=True)
     @patch("opencode_standup.app.StandupApp")

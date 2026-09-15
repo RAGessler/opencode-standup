@@ -537,7 +537,7 @@ def build_todo_report(
 
 
 def fmt_cost(v: float) -> str:
-    return f"${v:,.4f}" if v < 1 else f"${v:,.2f}"
+    return f"${v:,.2f}"
 
 
 def fmt_tokens(n: int) -> str:
