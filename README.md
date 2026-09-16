@@ -21,21 +21,23 @@ The app reads OpenCode's SQLite database directly. It also starts `opencode serv
 
 ## First-Time Setup
 
-### 1. Clone the repository
+### 1. Install from PyPI
 
-This repository is private, so the user needs GitHub access and an authenticated GitHub CLI or Git credential first.
+For normal use, install the published package with `pipx`. This keeps the tool isolated and lets it update itself without requiring a repository checkout or branch selection.
 
 ```bash
-gh auth login
-gh repo clone RAGessler/opencode-standup
-cd opencode-standup
+python3 -m pip install --user pipx
+python3 -m pipx ensurepath
+pipx install opencode-standup
 ```
 
-If the repository has already been cloned, update it before installing:
+If `pipx` is not available, install it into a dedicated virtual environment instead:
 
 ```bash
-cd /path/to/opencode-standup
-git pull --ff-only
+python3 -m venv ~/.local/share/opencode-standup/venv
+~/.local/share/opencode-standup/venv/bin/python -m pip install opencode-standup
+mkdir -p ~/.local/bin
+ln -sf ~/.local/share/opencode-standup/venv/bin/opencode-standup ~/.local/bin/opencode-standup
 ```
 
 ### 2. Check prerequisites
@@ -48,16 +50,6 @@ test -f "$HOME/.local/share/opencode/opencode.db" && echo "OpenCode database fou
 
 Python must be 3.10 or newer. If the database check fails, launch OpenCode and create or use at least one session first, then check the path again.
 
-### 3. Install the command
-
-Run this from the repository checkout:
-
-```bash
-./scripts/install.sh
-```
-
-The installer creates or reuses `~/.local/share/opencode-standup/venv`, installs this checkout in editable mode, and installs the `opencode-standup` launcher at `~/.local/bin/opencode-standup`.
-
 If the command is not found afterward, add the launcher directory to the current shell's `PATH`:
 
 ```bash
@@ -66,15 +58,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Add the same line to `~/.zshrc` or `~/.bashrc` to make it permanent, then open a new terminal or reload the file.
 
-To install the virtual environment somewhere else:
-
-```bash
-OPENCODE_STANDUP_INSTALL_ROOT=/path/to/install ./scripts/install.sh
-```
-
-The launcher is always written to `~/.local/bin`.
-
-### 4. Launch it
+### 3. Launch it
 
 ```bash
 opencode-standup
@@ -112,6 +96,7 @@ In the TUI, press `?` for the full keybinding list. The primary bindings are:
 - `u`: unarchive the selected archived session
 - `o`: open the selected session in OpenCode
 - `r`: refresh
+- `U`: check for updates
 - `q`: quit
 
 Select a session row with the arrow keys before using an action. Rename and archive start a local `opencode serve` process only when needed. Unarchive writes directly to the OpenCode database because the current OpenCode API does not expose an unarchive operation.
@@ -133,21 +118,24 @@ OPENCODE_STANDUP_JIRA_TIMEOUT=20
 
 ## Updating
 
-The install is editable, so update the checkout and rerun the installer:
+The TUI checks PyPI for a newer release once per day in the background. It does not block startup if the network is unavailable. When a release is available, the TUI shows the current and available versions and asks for confirmation before upgrading.
+
+You can also update manually:
 
 ```bash
-cd /path/to/opencode-standup
-git pull --ff-only
-./scripts/install.sh
+pipx upgrade opencode-standup
 ```
+
+Press `U` in the TUI to check immediately for updates. The update check only requests public package metadata from PyPI; it does not upload OpenCode sessions, transcripts, Jira data, or credentials.
+
+The legacy `scripts/install.sh` remains available for development from a source checkout. It installs that checkout in editable mode and is not the normal end-user installation path.
 
 ## Uninstalling
 
 Remove the launcher and the dedicated virtual environment:
 
 ```bash
-rm "$HOME/.local/bin/opencode-standup"
-rm -rf "$HOME/.local/share/opencode-standup"
+pipx uninstall opencode-standup
 ```
 
 This does not modify OpenCode's database or sessions.
@@ -164,7 +152,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ### `python3: command not found` or Python is too old
 
-Install Python 3.10 or newer, then rerun `./scripts/install.sh`.
+Install Python 3.10 or newer, then rerun the `pipx` installation command.
 
 ### `opencode database not found`
 
@@ -192,6 +180,14 @@ The selected session's repository directory must still exist, and the `opencode`
 
 ## Development
 
+The repository is private, so contributors need GitHub access and an authenticated GitHub CLI or Git credential:
+
+```bash
+gh auth login
+gh repo clone RAGessler/opencode-standup
+cd opencode-standup
+```
+
 Create a development environment and install the project in editable mode:
 
 ```bash
@@ -205,5 +201,17 @@ Basic validation:
 ```bash
 .venv/bin/python -m compileall src
 ```
+
+Build and audit release artifacts locally:
+
+```bash
+.venv/bin/python -m pip install build twine
+rm -rf dist build
+.venv/bin/python -m build
+.venv/bin/python -m twine check dist/*
+.venv/bin/python scripts/audit_package.py dist/*
+```
+
+Releases are created by pushing a version tag such as `v0.2.0`. GitHub Actions runs tests, audits the artifacts, and publishes them to PyPI using trusted publishing. Configure the PyPI project’s trusted publisher for this repository and the `pypi` GitHub environment before pushing the first release tag.
 
 The application requires a real OpenCode database to launch the interactive TUI. Use `--db` to point it at a test database when validating locally.

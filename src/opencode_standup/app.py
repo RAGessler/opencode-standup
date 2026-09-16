@@ -25,6 +25,7 @@ Actions (see the in-app help with `?`):
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
 import re
@@ -32,15 +33,18 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 
+from packaging.version import InvalidVersion, Version
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -62,6 +66,10 @@ from textual.widgets.tree import TreeNode
 from textual.worker import Worker, WorkerState
 
 DEFAULT_DB_PATH = os.path.expanduser("~/.local/share/opencode/opencode.db")
+PACKAGE_NAME = "opencode-standup"
+PYPI_METADATA_URL = "https://pypi.org/pypi/opencode-standup/json"
+UPDATE_CHECK_TIMEOUT = 3
+UPDATE_CACHE_TTL = 24 * 60 * 60
 SUMMARY_SESSION_TITLE = "opencode-standup AI summary"
 LEGACY_SUMMARY_TITLE_PREFIX = "Create a factual standup summary for"
 
@@ -78,6 +86,117 @@ SUMMARY_SESSION_MAX_CHARS = _env_int("OPENCODE_STANDUP_SUMMARY_SESSION_MAX_CHARS
 SUMMARY_COMMAND_TIMEOUT = _env_int("OPENCODE_STANDUP_SUMMARY_TIMEOUT", 120)
 JIRA_COMMAND_TIMEOUT = _env_int("OPENCODE_STANDUP_JIRA_TIMEOUT", 20)
 JIRA_KEY_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,9}-\d+\b", re.IGNORECASE)
+
+
+def app_version() -> str:
+    """Return the installed distribution version, with a source-tree fallback."""
+    try:
+        return importlib.metadata.version(PACKAGE_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        from opencode_standup import __version__
+
+        return __version__
+
+
+@dataclass(frozen=True)
+class UpdateInfo:
+    version: str
+    release_url: str
+
+
+def update_cache_path() -> Path:
+    cache_root = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+    return Path(cache_root) / PACKAGE_NAME / "update.json"
+
+
+def _read_update_cache() -> dict[str, object]:
+    try:
+        payload = json.loads(update_cache_path().read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_update_cache(payload: dict[str, object]) -> None:
+    path = update_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError:
+        # An update check must never prevent the application from starting.
+        pass
+
+
+def should_check_for_update(now: float | None = None) -> bool:
+    checked_at = _read_update_cache().get("checked_at")
+    if not isinstance(checked_at, (int, float)):
+        return True
+    return (now or time.time()) - checked_at >= UPDATE_CACHE_TTL
+
+
+def mark_update_checked() -> None:
+    cache = _read_update_cache()
+    cache["checked_at"] = time.time()
+    _write_update_cache(cache)
+
+
+def mark_update_prompted(version: str) -> None:
+    cache = _read_update_cache()
+    cache["prompted_version"] = version
+    _write_update_cache(cache)
+
+
+def should_prompt_for_update(update: UpdateInfo | None) -> bool:
+    if update is None:
+        return False
+    prompted_version = _read_update_cache().get("prompted_version")
+    return prompted_version != update.version
+
+
+def check_for_update(force: bool = False) -> UpdateInfo | None:
+    if not force and not should_check_for_update():
+        return None
+
+    request = urllib.request.Request(
+        PYPI_METADATA_URL,
+        headers={"Accept": "application/json", "User-Agent": f"{PACKAGE_NAME}/{app_version()}",},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=UPDATE_CHECK_TIMEOUT) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        remote_version = payload["info"]["version"]
+        Version(remote_version)
+    except (OSError, KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError, InvalidVersion):
+        return None
+    finally:
+        mark_update_checked()
+
+    if Version(remote_version) <= Version(app_version()):
+        return None
+    return UpdateInfo(
+        version=remote_version,
+        release_url=f"https://pypi.org/project/{PACKAGE_NAME}/{remote_version}/",
+    )
+
+
+def install_update() -> tuple[bool, str]:
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", PACKAGE_NAME],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if completed.returncode != 0:
+        return False, completed.stderr.strip() or "pip exited unsuccessfully"
+    return True, completed.stdout.strip() or "Updated successfully."
+
+
+def restart_application() -> None:
+    os.execv(sys.executable, [sys.executable, "-m", "opencode_standup.app", *sys.argv[1:]])
 
 
 # --------------------------------------------------------------------------
@@ -1028,12 +1147,74 @@ class ConfirmModal(ModalScreen[bool]):
             self.dismiss(True)
 
 
+class UpdateModal(ModalScreen[str | None]):
+    CSS = """
+    UpdateModal {
+        align: center middle;
+    }
+    #dialog {
+        width: 76;
+        height: auto;
+        padding: 1 2;
+        border: thick $accent;
+        background: $surface;
+    }
+    #message {
+        margin-bottom: 1;
+    }
+    #buttons {
+        height: auto;
+        align: center middle;
+    }
+    #buttons Button {
+        margin: 0 1;
+    }
+    """
+
+    def __init__(self, update: UpdateInfo) -> None:
+        super().__init__()
+        self.update = update
+
+    def compose(self) -> ComposeResult:
+        with Container(id="dialog"):
+            yield Static(
+                f"A new version of opencode-standup is available.\n\n"
+                f"Current version: {app_version()}\n"
+                f"Available version: {self.update.version}\n\n"
+                f"Release notes: {self.update.release_url}",
+                id="message",
+            )
+            with Container(id="buttons"):
+                yield Button("Update now", id="update", variant="success")
+                yield Button("Later", id="later", variant="primary")
+                yield Button("Open release notes", id="release-notes")
+
+    @on(Button.Pressed, "#update")
+    def update_now(self) -> None:
+        self.dismiss("update")
+
+    @on(Button.Pressed, "#later")
+    def later(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#release-notes")
+    def release_notes(self) -> None:
+        webbrowser.open(self.update.release_url)
+
+    def on_key(self, event) -> None:
+        if event.key in ("escape", "n"):
+            self.dismiss(None)
+        elif event.key in ("enter", "y"):
+            self.dismiss("update")
+
+
 HELP_TEXT = """\
 [b]opencode-standup — keybindings[/b]
 
 [b]Global[/b]
   q          Quit
   r          Refresh current tab
+  U          Check for updates
   [ / ]      Previous / next tab
   ?          Show this help
 
@@ -1133,6 +1314,7 @@ class StandupApp(App):
         Binding("[", "prev_tab", "Prev tab", show=False),
         Binding("]", "next_tab", "Next tab", show=False),
         Binding("question_mark", "show_help", "Help", show=False),
+        Binding("U", "check_for_updates", "Check for updates", show=False),
     ]
 
     def __init__(self, db_path: str, scope: Scope):
@@ -1150,6 +1332,9 @@ class StandupApp(App):
         self.summary_jira_error: str | None = None
         self.summary_worker: Worker[tuple[int, SummaryResult]] | None = None
         self.summary_request_id = 0
+        self.update_worker: Worker[UpdateInfo | None] | None = None
+        self.install_worker: Worker[tuple[bool, str]] | None = None
+        self._pending_update: UpdateInfo | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1168,6 +1353,7 @@ class StandupApp(App):
     def on_mount(self) -> None:
         self.title = "opencode standup"
         self.load_and_render()
+        self._start_update_check()
 
     def on_unmount(self) -> None:
         self.server.stop()
@@ -1197,6 +1383,56 @@ class StandupApp(App):
         self.summary_jira_error = None
         if self.is_mounted:
             self.render_ai_summary()
+
+    @work(thread=True, exclusive=True, group="update-check", exit_on_error=False)
+    def _check_update_worker(self, force: bool = False) -> UpdateInfo | None:
+        return check_for_update(force=force)
+
+    def _start_update_check(self, force: bool = False) -> None:
+        self.update_worker = self._check_update_worker(force)
+
+    @on(Worker.StateChanged)
+    def _update_worker_changed(self, event: Worker.StateChanged) -> None:
+        if event.worker is not self.update_worker:
+            return
+        if event.state != WorkerState.SUCCESS:
+            return
+        update = event.worker.result
+        if update is None:
+            return
+        if not should_prompt_for_update(update):
+            return
+        self._pending_update = update
+        self.push_screen(UpdateModal(update), self._handle_update_choice)
+
+    def _handle_update_choice(self, choice: str | None) -> None:
+        if choice != "update":
+            update = self._pending_update
+            if update is not None:
+                mark_update_prompted(update.version)
+            return
+        self.notify("Updating opencode-standup...", timeout=10)
+        self.install_worker = self._install_update_worker()
+
+    @work(thread=True, exclusive=True, group="install-update", exit_on_error=False)
+    def _install_update_worker(self) -> tuple[bool, str]:
+        return install_update()
+
+    @on(Worker.StateChanged)
+    def _install_worker_changed(self, event: Worker.StateChanged) -> None:
+        if event.worker is not self.install_worker:
+            return
+        if event.state == WorkerState.SUCCESS:
+            success, message = event.worker.result
+            if success:
+                if self._pending_update is not None:
+                    mark_update_prompted(self._pending_update.version)
+                self.notify("Updated. Restarting opencode-standup...", timeout=5)
+                self.call_after_refresh(restart_application)
+            else:
+                self.notify(f"Update failed: {message}", severity="error", timeout=10)
+        elif event.state == WorkerState.ERROR:
+            self.notify(f"Update failed: {event.worker.error}", severity="error", timeout=10)
 
     def render_ai_summary(self) -> None:
         widget = self.query_one("#ai-summary", Markdown)
@@ -1442,6 +1678,13 @@ class StandupApp(App):
     def action_refresh_report(self) -> None:
         self.load_and_render()
 
+    def action_check_for_updates(self) -> None:
+        if self.update_worker is not None and self.update_worker.is_running:
+            self.notify("Already checking for updates.", severity="warning")
+            return
+        self.notify("Checking for updates...", timeout=5)
+        self._start_update_check(force=True)
+
     def action_show_help(self) -> None:
         self.push_screen(HelpModal())
 
@@ -1531,6 +1774,11 @@ class StandupApp(App):
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="A daily command-center for opencode sessions across your repos."
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {app_version()}",
     )
     parser.add_argument(
         "--date",
