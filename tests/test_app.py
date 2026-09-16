@@ -1,12 +1,134 @@
 import sys
+import json
+import sqlite3
+import tempfile
 import unittest
 from datetime import date
+from pathlib import Path
 from unittest.mock import patch
 
-from opencode_standup.app import Scope, ScopeKind, day_bounds_ms, fmt_cost, main
+from opencode_standup.app import (
+    JiraIssue,
+    Scope,
+    ScopeKind,
+    SummaryGenerationError,
+    day_bounds_ms,
+    extract_jira_keys,
+    fmt_cost,
+    parse_jira_output,
+    parse_opencode_output,
+    load_session_excerpts,
+    main,
+    SessionRow,
+)
 
 
 class MainTests(unittest.TestCase):
+    def test_extracts_jira_keys_case_insensitively(self) -> None:
+        self.assertEqual(extract_jira_keys("Fix BSS-123 and bss-123, not abc-4"), {"BSS-123", "ABC-4"})
+
+    def test_parses_jira_issue_context(self) -> None:
+        raw = '{"data":{"items":{"sections":{"issues":[{"key":"BSS-123","summary":"Preview","status":"Open","webUrl":"https://jira/BSS-123"}]}}}}'
+
+        self.assertEqual(
+            parse_jira_output(raw),
+            [JiraIssue("BSS-123", "Preview", "Open", "https://jira/BSS-123")],
+        )
+
+    def test_invalid_jira_json_is_explicit(self) -> None:
+        with self.assertRaises(SummaryGenerationError):
+            parse_jira_output("not json")
+
+    def test_jira_error_payload_is_unavailable(self) -> None:
+        with self.assertRaises(SummaryGenerationError):
+            parse_jira_output('{"data":{"error":"unauthorized"}}')
+
+    def test_parses_text_from_opencode_json_events(self) -> None:
+        raw = '{"part":{"type":"text","text":"Summary"}}\n{"part":{"type":"tool","state":{}}}'
+
+        self.assertEqual(parse_opencode_output(raw), "Summary")
+
+    def test_rejects_opencode_output_without_text(self) -> None:
+        with self.assertRaises(SummaryGenerationError):
+            parse_opencode_output('{"part":{"type":"tool"}}')
+
+    def test_session_excerpts_include_descendants_but_exclude_noise(self) -> None:
+        root = SessionRow(
+            id="root",
+            parent_id=None,
+            project_id="project",
+            directory="/repo",
+            title="BSS-123 implementation",
+            agent=None,
+            time_created=day_bounds_ms(date(2026, 9, 15))[0],
+            time_archived=None,
+            cost=0.5,
+            tokens_input=0,
+            tokens_output=0,
+            tokens_reasoning=0,
+            tokens_cache_read=0,
+            tokens_cache_write=0,
+            additions=2,
+            deletions=1,
+            files=1,
+        )
+        child = SessionRow(
+            **{**root.__dict__, "id": "child", "parent_id": "root", "title": "child analysis"}
+        )
+        outside = SessionRow(
+            **{**root.__dict__, "id": "outside", "time_created": day_bounds_ms(date(2026, 9, 16))[0]}
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = str(Path(directory) / "test.db")
+            day_start = day_bounds_ms(date(2026, 9, 15))[0]
+            conn = sqlite3.connect(db_path)
+            conn.executescript(
+                """
+                CREATE TABLE session_input (session_id TEXT, prompt TEXT, time_created INTEGER);
+                CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
+                CREATE TABLE part (message_id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
+                """
+            )
+            conn.executemany(
+                "INSERT INTO session_input VALUES (?, ?, ?)",
+                [("root", "Implement BSS-123", day_start), ("outside", "Do not include", 2)],
+            )
+            conn.executemany(
+                "INSERT INTO message VALUES (?, ?, ?)",
+                [
+                    ("m1", "root", json.dumps({"role": "assistant"})),
+                    ("m2", "child", json.dumps({"role": "assistant"})),
+                    ("m3", "child", json.dumps({"role": "assistant"})),
+                    ("m4", "child", json.dumps({"role": "assistant"})),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO part VALUES (?, ?, ?, ?)",
+                [
+                    ("m1", "root", json.dumps({"type": "text", "text": "Implemented it"}), day_start),
+                    ("m2", "child", json.dumps({"type": "text", "text": "Analyzed details"}), day_start + 1),
+                    ("m3", "child", json.dumps({"type": "tool", "text": "secret tool output"}), day_start + 2),
+                    ("m4", "child", json.dumps({"type": "reasoning", "text": "private reasoning"}), day_start + 3),
+                ],
+            )
+            conn.commit()
+            conn.close()
+
+            text, keys = load_session_excerpts(
+                db_path,
+                [root, child, outside],
+                {"project": "Example"},
+                Scope(ScopeKind.CUSTOM, date(2026, 9, 15)),
+            )
+
+        self.assertIn("Implemented it", text)
+        self.assertIn("Analyzed details", text)
+        self.assertNotIn("secret tool output", text)
+        self.assertNotIn("private reasoning", text)
+        self.assertNotIn("Do not include", text)
+        self.assertEqual(keys, {"BSS-123"})
+
     def test_costs_are_displayed_to_two_decimal_places(self) -> None:
         self.assertEqual(fmt_cost(0.1234), "$0.12")
         self.assertEqual(fmt_cost(1234.5678), "$1,234.57")

@@ -16,7 +16,7 @@ Actions (see the in-app help with `?`):
   u  unarchive the selected (archived) session -- direct DB write, since
      opencode's API does not currently expose an "unarchive" operation
   o  open/resume the selected session in the real opencode TUI
-  1-4  switch time scope (Standup tab)
+  1-5  switch time scope (Standup tab)
   [ ]  switch tabs
   r  refresh
   q  quit
@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -40,7 +41,7 @@ from datetime import date, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 
-from textual import on
+from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, VerticalScroll
@@ -51,14 +52,30 @@ from textual.widgets import (
     Header,
     Input,
     Label,
+    Markdown,
     Static,
     TabbedContent,
     TabPane,
     Tree,
 )
 from textual.widgets.tree import TreeNode
+from textual.worker import Worker, WorkerState
 
 DEFAULT_DB_PATH = os.path.expanduser("~/.local/share/opencode/opencode.db")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+SUMMARY_MAX_CHARS = _env_int("OPENCODE_STANDUP_SUMMARY_MAX_CHARS", 12000)
+SUMMARY_SESSION_MAX_CHARS = _env_int("OPENCODE_STANDUP_SUMMARY_SESSION_MAX_CHARS", 2600)
+SUMMARY_COMMAND_TIMEOUT = _env_int("OPENCODE_STANDUP_SUMMARY_TIMEOUT", 120)
+JIRA_COMMAND_TIMEOUT = _env_int("OPENCODE_STANDUP_JIRA_TIMEOUT", 20)
+JIRA_KEY_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,9}-\d+\b", re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------
@@ -244,6 +261,34 @@ class TodoProjectGroup:
     sessions: list[tuple[SessionRow, list[TodoItem]]] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class JiraIssue:
+    key: str
+    summary: str = ""
+    status: str = ""
+    url: str = ""
+
+
+@dataclass(frozen=True)
+class SummaryContext:
+    workday: date
+    text: str
+    jira_issues: tuple[JiraIssue, ...]
+    jira_available: bool
+    jira_error: str | None = None
+
+
+@dataclass(frozen=True)
+class SummaryResult:
+    text: str
+    jira_available: bool
+    jira_error: str | None = None
+
+
+class SummaryGenerationError(RuntimeError):
+    pass
+
+
 # --------------------------------------------------------------------------
 # DB access (reads are always via a read-only connection)
 # --------------------------------------------------------------------------
@@ -329,6 +374,319 @@ def load_open_todos(db_path: str) -> list[TodoItem]:
         )
         for r in rows
     ]
+
+
+def extract_jira_keys(text: str) -> set[str]:
+    return {match.upper() for match in JIRA_KEY_RE.findall(text)}
+
+
+def _clip(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _summary_session_ids(
+    sessions: list[SessionRow],
+    scope: Scope,
+    include_archived: bool,
+) -> set[str]:
+    start_ms, end_ms = scope.bounds_ms()
+    roots = {
+        session.id
+        for session in sessions
+        if session.parent_id is None
+        and start_ms <= session.time_created < end_ms
+        and (include_archived or session.time_archived is None)
+    }
+    children: dict[str, list[str]] = defaultdict(list)
+    by_id = {session.id: session for session in sessions}
+    for session in sessions:
+        if session.parent_id:
+            children[session.parent_id].append(session.id)
+    relevant_ids = set(roots)
+    stack = list(roots)
+    while stack:
+        session_id = stack.pop()
+        for child_id in children.get(session_id, []):
+            child = by_id.get(child_id)
+            if child is None or (not include_archived and child.time_archived is not None):
+                continue
+            if child_id not in relevant_ids:
+                relevant_ids.add(child_id)
+                stack.append(child_id)
+    return relevant_ids
+
+
+def load_session_excerpts(
+    db_path: str,
+    sessions: list[SessionRow],
+    project_names: dict[str, str],
+    scope: Scope,
+    include_archived: bool = False,
+) -> tuple[str, set[str]]:
+    start_ms, end_ms = scope.bounds_ms()
+    roots = [
+        session
+        for session in sessions
+        if session.parent_id is None
+        and start_ms <= session.time_created < end_ms
+        and (include_archived or session.time_archived is None)
+    ]
+    if not roots:
+        return "No OpenCode sessions were recorded for this workday.", set()
+
+    relevant_ids = _summary_session_ids(sessions, scope, include_archived)
+    relevant_sessions = [session for session in sessions if session.id in relevant_ids]
+    conn = _ro_connect(db_path)
+    try:
+        input_rows = conn.execute(
+            "SELECT session_id, prompt FROM session_input "
+            "WHERE session_id IN ({}) AND ? <= time_created AND time_created < ? "
+            "ORDER BY time_created".format(
+                ",".join("?" for _ in relevant_ids)
+            ),
+            (*relevant_ids, start_ms, end_ms),
+        ).fetchall()
+        part_rows = conn.execute(
+            "SELECT p.session_id, p.data, m.data AS message_data "
+            "FROM part p JOIN message m ON m.id = p.message_id "
+            "WHERE p.session_id IN ({}) AND ? <= p.time_created AND p.time_created < ? "
+            "ORDER BY p.time_created".format(
+                ",".join("?" for _ in relevant_ids)
+            ),
+            (*relevant_ids, start_ms, end_ms),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    prompts: dict[str, list[str]] = defaultdict(list)
+    for row in input_rows:
+        prompts[row["session_id"]].append(row["prompt"])
+    assistant_text: dict[str, list[str]] = defaultdict(list)
+    user_text: dict[str, list[str]] = defaultdict(list)
+    for row in part_rows:
+        try:
+            data = json.loads(row["data"])
+            message_data = json.loads(row["message_data"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if data.get("type") == "text" and data.get("text"):
+            if message_data.get("role") == "user":
+                user_text[row["session_id"]].append(data["text"])
+            elif message_data.get("role") == "assistant":
+                assistant_text[row["session_id"]].append(data["text"])
+
+    sections: list[str] = []
+    jira_keys: set[str] = set()
+    for session in sorted(relevant_sessions, key=lambda item: item.time_created):
+        project = project_names.get(session.project_id) or os.path.basename(
+            session.directory.rstrip("/")
+        ) or session.directory
+        excerpts: list[str] = []
+        session_prompts = user_text.get(session.id) or prompts.get(session.id, [])
+        for prompt in session_prompts:
+            excerpts.append(f"User: {_clip(prompt, 700)}")
+        for response in assistant_text.get(session.id, [])[-1:]:
+            excerpts.append(f"Assistant: {_clip(response, 700)}")
+        raw_content = "\n".join(excerpts)
+        jira_keys.update(extract_jira_keys(raw_content))
+        content = raw_content
+        if content:
+            content = _clip(content, SUMMARY_SESSION_MAX_CHARS)
+        section = (
+            f"Project: {project}\n"
+            f"Session: {session.title}\n"
+            f"Changes: +{session.additions}/-{session.deletions} across {session.files} files\n"
+            f"Cost: {fmt_cost(session.cost)}\n"
+            f"Transcript excerpts:\n{content or '(none)'}"
+        )
+        sections.append(section)
+        jira_keys.update(extract_jira_keys(session.title))
+
+    return _clip("\n\n---\n\n".join(sections), SUMMARY_MAX_CHARS), jira_keys
+
+
+def parse_jira_output(raw: str) -> list[JiraIssue]:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SummaryGenerationError("twg returned invalid JSON.") from exc
+    data = payload.get("data", payload) if isinstance(payload, dict) else {}
+    items = data.get("items") if isinstance(data, dict) else None
+    if isinstance(data, dict) and (
+        data.get("error") or (isinstance(items, dict) and items.get("error"))
+    ):
+        raise SummaryGenerationError("twg returned a Jira error response.")
+    sections = items.get("sections", {}) if isinstance(items, dict) else {}
+    if not isinstance(sections, dict):
+        raise SummaryGenerationError("twg returned an unexpected Jira response.")
+    issues = sections.get("issues", []) if isinstance(sections, dict) else []
+    return [
+        JiraIssue(
+            key=item.get("key", ""),
+            summary=item.get("summary", ""),
+            status=item.get("status", ""),
+            url=item.get("webUrl", ""),
+        )
+        for item in issues
+        if item.get("key")
+    ]
+
+
+def load_jira_context(workday: date) -> tuple[list[JiraIssue], bool, str | None]:
+    command = [
+        "twg",
+        "work",
+        "query",
+        "--scope",
+        "me",
+        "--from",
+        workday.isoformat(),
+        "--to",
+        (workday + timedelta(days=1)).isoformat(),
+        "--types",
+        "jira",
+        "--activity",
+        "all",
+        "--hydrate",
+        "summary",
+        "--items-per-section",
+        "50",
+        "--output",
+        "json",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=JIRA_COMMAND_TIMEOUT,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return [], False, str(exc)
+    if completed.returncode != 0:
+        return [], False, completed.stderr.strip() or "twg exited unsuccessfully"
+    raw_output = completed.stdout
+    if not raw_output.lstrip().startswith("{"):
+        match = re.search(r'^  stdout: "(.+)"$', raw_output, re.MULTILINE)
+        if match:
+            try:
+                artifact_path = json.loads(f'"{match.group(1)}"')
+                with open(artifact_path, encoding="utf-8") as artifact:
+                    raw_output = artifact.read()
+            except (OSError, json.JSONDecodeError) as exc:
+                return [], False, f"Could not read twg output: {exc}"
+    try:
+        issues = parse_jira_output(raw_output)
+    except SummaryGenerationError as exc:
+        return [], False, str(exc)
+    return issues, True, None
+
+
+def build_summary_context(
+    db_path: str,
+    sessions: list[SessionRow],
+    project_names: dict[str, str],
+    scope: Scope,
+    include_archived: bool = False,
+) -> SummaryContext:
+    workday = last_workday(date.today()) if scope.kind == ScopeKind.LAST_WORKDAY else date.today()
+    transcript, chat_keys = load_session_excerpts(
+        db_path, sessions, project_names, scope, include_archived
+    )
+    jira_issues, jira_available, jira_error = load_jira_context(workday)
+    by_key = {issue.key.upper(): issue for issue in jira_issues}
+    for key in sorted(chat_keys):
+        by_key.setdefault(key, JiraIssue(key=key))
+    jira_text = "\n".join(
+        f"{issue.key}: {issue.summary or '(mentioned in chat; no Jira activity result)'}"
+        f" [{issue.status}] {issue.url}".strip()
+        for issue in by_key.values()
+    )
+    return SummaryContext(
+        workday=workday,
+        text=(
+            f"OpenCode work:\n{transcript}\n\n"
+            f"Jira context:\n{jira_text or '(none)'}"
+        ),
+        jira_issues=tuple(by_key.values()),
+        jira_available=jira_available,
+        jira_error=jira_error,
+    )
+
+
+def parse_opencode_output(raw: str) -> str:
+    response_parts: list[str] = []
+    for line in raw.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        part = event.get("part", {}) if isinstance(event, dict) else {}
+        if part.get("type") == "text" and part.get("text"):
+            response_parts.append(part["text"])
+        elif event.get("type") == "text" and event.get("text"):
+            response_parts.append(event["text"])
+    result = "\n".join(response_parts).strip()
+    if not result:
+        raise SummaryGenerationError("OpenCode returned no summary text.")
+    return result
+
+
+def generate_summary(context: SummaryContext) -> str:
+    jira_note = (
+        "Jira activity was unavailable; use only chat-derived Jira references."
+        if not context.jira_available
+        else "Jira activity was available and may be used when supported by the context."
+    )
+    prompt = f"""Create a factual standup summary for {context.workday.isoformat()}.
+
+Output exactly:
+1. A concise 1-2 sentence narrative recap.
+2. Markdown sections with bullets: Progress, Jira work, Blockers or risks, Next steps.
+
+Use only the supplied context. Do not invent work, ticket details, blockers, or next steps.
+Mention uncertainty when evidence is incomplete. Include Jira keys and links when supplied.
+Do not call tools or inspect files; answer directly from this context.
+{jira_note}
+
+Context:
+{context.text}
+"""
+    try:
+        completed = subprocess.run(
+            ["opencode", "run", "--format", "json", prompt],
+            capture_output=True,
+            text=True,
+            timeout=SUMMARY_COMMAND_TIMEOUT,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise SummaryGenerationError(str(exc)) from exc
+    if completed.returncode != 0:
+        raise SummaryGenerationError(completed.stderr.strip() or "opencode exited unsuccessfully")
+    return parse_opencode_output(completed.stdout)
+
+
+def generate_last_workday_summary(db_path: str, include_archived: bool) -> SummaryResult:
+    sessions = load_sessions(db_path)
+    project_names = load_project_names(db_path)
+    scope = Scope(ScopeKind.LAST_WORKDAY)
+    context = build_summary_context(
+        db_path,
+        sessions,
+        project_names,
+        scope,
+        include_archived,
+    )
+    return SummaryResult(
+        text=generate_summary(context),
+        jira_available=context.jira_available,
+        jira_error=context.jira_error,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -665,6 +1023,7 @@ HELP_TEXT = """\
   3          This week
   4          All time
   5          Current sprint
+  s          Generate Last workday AI summary
 
 [b]Actions (select a task/session row first)[/b]
   o          Open/resume this session in the real opencode TUI
@@ -720,6 +1079,14 @@ class StandupApp(App):
         border: round $accent;
         margin: 1 2 0 2;
     }
+    #ai-summary {
+        height: auto;
+        max-height: 18;
+        overflow-y: auto;
+        padding: 1 2;
+        border: round $success;
+        margin: 1 2 0 2;
+    }
     #tree-container, #todo-tree-container {
         height: 1fr;
         margin: 1 2;
@@ -742,6 +1109,7 @@ class StandupApp(App):
         ("3", "set_scope_week", "Week"),
         ("4", "set_scope_all", "All"),
         ("5", "set_scope_sprint", "Sprint"),
+        Binding("s", "generate_summary", "Generate summary", show=False),
         Binding("[", "prev_tab", "Prev tab", show=False),
         Binding("]", "next_tab", "Next tab", show=False),
         Binding("question_mark", "show_help", "Help", show=False),
@@ -755,11 +1123,19 @@ class StandupApp(App):
         self.groups: list[ProjectGroup] = []
         self.todo_groups: list[TodoProjectGroup] = []
         self.server = OpencodeServer()
+        self.summary_text: str | None = None
+        self.summary_error: str | None = None
+        self.summary_loading = False
+        self.summary_jira_available = True
+        self.summary_jira_error: str | None = None
+        self.summary_worker: Worker[tuple[int, SummaryResult]] | None = None
+        self.summary_request_id = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with TabbedContent(initial="standup-tab"):
             with TabPane("Standup", id="standup-tab"):
+                yield Markdown(id="ai-summary")
                 yield Static(id="summary")
                 with VerticalScroll(id="tree-container"):
                     yield Tree("opencode standup", id="report-tree")
@@ -779,6 +1155,7 @@ class StandupApp(App):
     # -- data loading ------------------------------------------------------
 
     def load_and_render(self) -> None:
+        self._invalidate_summary()
         sessions = load_sessions(self.db_path)
         project_names = load_project_names(self.db_path)
         todos = load_open_todos(self.db_path)
@@ -791,9 +1168,70 @@ class StandupApp(App):
         self.render_todo_summary()
         self.render_todo_tree()
 
+    def _invalidate_summary(self) -> None:
+        self.summary_request_id += 1
+        self.summary_text = None
+        self.summary_error = None
+        self.summary_loading = False
+        self.summary_jira_available = True
+        self.summary_jira_error = None
+        if self.is_mounted:
+            self.render_ai_summary()
+
+    def render_ai_summary(self) -> None:
+        widget = self.query_one("#ai-summary", Markdown)
+        if self.scope.kind != ScopeKind.LAST_WORKDAY:
+            widget.display = False
+            return
+        widget.display = True
+        if self.summary_loading:
+            widget.update("**AI standup summary**\n\nGenerating summary…")
+        elif self.summary_error:
+            widget.update(f"**AI standup summary**\n\n{self.summary_error}")
+        elif self.summary_text:
+            note = ""
+            if not self.summary_jira_available:
+                detail = self.summary_jira_error or "Jira context was unavailable."
+                note = f"\n\n> _Chat-only summary: {detail}_"
+            widget.update(f"**AI standup summary**\n\n{self.summary_text}{note}")
+        else:
+            widget.update("**AI standup summary**\n\nPress `s` to generate.")
+
+    @work(
+        thread=True,
+        exclusive=True,
+        group="summary",
+        exit_on_error=False,
+        description="Generate last-workday AI summary",
+    )
+    def _generate_summary_worker(self, request_id: int) -> tuple[int, SummaryResult]:
+        return request_id, generate_last_workday_summary(
+            self.db_path, self.include_archived
+        )
+
+    @on(Worker.StateChanged)
+    def _summary_worker_changed(self, event: Worker.StateChanged) -> None:
+        if event.worker is not self.summary_worker:
+            return
+        if event.state == WorkerState.SUCCESS:
+            request_id, result = event.worker.result  # type: ignore[misc]
+            if request_id != self.summary_request_id:
+                return
+            self.summary_text = result.text
+            self.summary_jira_available = result.jira_available
+            self.summary_jira_error = result.jira_error
+            self.summary_error = None
+        elif event.state == WorkerState.ERROR:
+            self.summary_error = str(event.worker.error or "Summary generation failed.")
+        else:
+            return
+        self.summary_loading = False
+        self.render_ai_summary()
+
     # -- Standup tab rendering ----------------------------------------------
 
     def render_summary(self) -> None:
+        self.render_ai_summary()
         scope_label = self.scope.label()
         grand = TaskTotals()
         task_count = 0
@@ -937,6 +1375,22 @@ class StandupApp(App):
     def action_set_scope_today(self) -> None:
         self.scope = Scope(ScopeKind.TODAY)
         self.load_and_render()
+
+    def action_generate_summary(self) -> None:
+        if self.scope.kind != ScopeKind.LAST_WORKDAY:
+            self.notify("AI summaries are available for Last workday only.", severity="warning")
+            return
+        if self.summary_loading or (
+            self.summary_worker is not None and self.summary_worker.is_running
+        ):
+            self.notify("A summary is already being generated.", severity="warning")
+            return
+        self.summary_request_id += 1
+        self.summary_text = None
+        self.summary_error = None
+        self.summary_loading = True
+        self.render_ai_summary()
+        self.summary_worker = self._generate_summary_worker(self.summary_request_id)
 
     def action_set_scope_last_workday(self) -> None:
         self.scope = Scope(ScopeKind.LAST_WORKDAY)

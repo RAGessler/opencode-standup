@@ -6,6 +6,7 @@ It provides:
 
 - A standup view grouping sessions by project for today, the last workday, this week, or all time
 - A current sprint view for September 14 through September 25, 2026
+- An on-demand AI summary of the previous workday using OpenCode chat and Jira context
 - Cost and token rollups, including subagent spend
 - A todo view of outstanding todo items across sessions
 - Session rename, archive, unarchive, and resume actions
@@ -103,6 +104,7 @@ The command exits with an error if the configured database does not exist.
 In the TUI, press `?` for the full keybinding list. The primary bindings are:
 
 - `1` through `5`: change the standup time scope, including the current sprint
+- `s`: generate an AI summary when the selected scope is Last workday
 - `[` and `]`: switch tabs
 - `e`: rename the selected session
 - `x`: archive the selected session
@@ -113,6 +115,21 @@ In the TUI, press `?` for the full keybinding list. The primary bindings are:
 - `q`: quit
 
 Select a session row with the arrow keys before using an action. Rename and archive start a local `opencode serve` process only when needed. Unarchive writes directly to the OpenCode database because the current OpenCode API does not expose an unarchive operation.
+
+### AI Standup Summary
+
+When the selected scope is **Last workday**, press `s` to generate a summary above the normal overview. It contains a short narrative followed by bullets for progress, Jira work, blockers or risks, and next steps. The summary is generated on demand with the provider and model already configured for `opencode`.
+
+The app sends bounded excerpts from relevant OpenCode session prompts and assistant responses, along with session metadata and Jira ticket metadata, to OpenCode. Tool output and reasoning are excluded. Jira enrichment uses the authenticated `twg` command for your Jira activity during the previous workday and is optional; if it is unavailable, the app generates a clearly labeled chat-only summary.
+
+The context and process limits can be adjusted with environment variables:
+
+```bash
+OPENCODE_STANDUP_SUMMARY_MAX_CHARS=12000
+OPENCODE_STANDUP_SUMMARY_SESSION_MAX_CHARS=2600
+OPENCODE_STANDUP_SUMMARY_TIMEOUT=120
+OPENCODE_STANDUP_JIRA_TIMEOUT=20
+```
 
 ## Updating
 
