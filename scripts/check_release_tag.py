@@ -11,7 +11,7 @@ from opencode_standup import __version__
 
 
 def main() -> int:
-    tag = os.environ.get("GITHUB_REF_NAME", "")
+    tag = os.environ.get("RELEASE_TAG") or os.environ.get("GITHUB_REF_NAME", "")
     match = re.fullmatch(r"v(.+)", tag)
     if match is None:
         print(f"Expected a v-prefixed release tag, got {tag!r}.", file=sys.stderr)

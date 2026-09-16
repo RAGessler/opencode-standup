@@ -30,7 +30,7 @@ jobs:
       - run: python -m pip install --upgrade build twine
       - run: PYTHONPATH=src python scripts/check_release_tag.py
         env:
-          GITHUB_REF_NAME: ${{ env.RELEASE_TAG }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
       - run: python -m build
       - run: python -m twine check dist/*
       - run: python scripts/audit_package.py dist/*
