@@ -18,12 +18,47 @@ from opencode_standup.app import (
     parse_jira_output,
     parse_opencode_output,
     load_session_excerpts,
+    build_report,
+    is_summary_session,
     main,
     SessionRow,
 )
 
 
 class MainTests(unittest.TestCase):
+    def test_summary_sessions_are_excluded_from_reports(self) -> None:
+        normal = SessionRow(
+            id="normal",
+            parent_id=None,
+            project_id="project",
+            directory="/repo",
+            title="Normal work",
+            agent=None,
+            time_created=day_bounds_ms(date(2026, 9, 15))[0],
+            time_archived=None,
+            cost=1.0,
+            tokens_input=0,
+            tokens_output=0,
+            tokens_reasoning=0,
+            tokens_cache_read=0,
+            tokens_cache_write=0,
+            additions=0,
+            deletions=0,
+            files=0,
+        )
+        generated = SessionRow(**{**normal.__dict__, "id": "generated", "title": "opencode-standup AI summary"})
+        legacy = SessionRow(**{**normal.__dict__, "id": "legacy", "title": "Create a factual standup summary for 2026-09-15."})
+
+        report = build_report(
+            [normal, generated, legacy],
+            {"project": "Example"},
+            Scope(ScopeKind.CUSTOM, date(2026, 9, 15)),
+        )
+
+        self.assertTrue(is_summary_session(generated))
+        self.assertTrue(is_summary_session(legacy))
+        self.assertEqual([task.root.id for task in report[0].tasks], ["normal"])
+
     def test_extracts_jira_keys_case_insensitively(self) -> None:
         self.assertEqual(extract_jira_keys("Fix BSS-123 and bss-123, not abc-4"), {"BSS-123", "ABC-4"})
 

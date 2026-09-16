@@ -62,6 +62,8 @@ from textual.widgets.tree import TreeNode
 from textual.worker import Worker, WorkerState
 
 DEFAULT_DB_PATH = os.path.expanduser("~/.local/share/opencode/opencode.db")
+SUMMARY_SESSION_TITLE = "opencode-standup AI summary"
+LEGACY_SUMMARY_TITLE_PREFIX = "Create a factual standup summary for"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -289,6 +291,11 @@ class SummaryGenerationError(RuntimeError):
     pass
 
 
+def is_summary_session(session: SessionRow) -> bool:
+    title = session.title.strip()
+    return title == SUMMARY_SESSION_TITLE or title.startswith(LEGACY_SUMMARY_TITLE_PREFIX)
+
+
 # --------------------------------------------------------------------------
 # DB access (reads are always via a read-only connection)
 # --------------------------------------------------------------------------
@@ -397,6 +404,7 @@ def _summary_session_ids(
         session.id
         for session in sessions
         if session.parent_id is None
+        and not is_summary_session(session)
         and start_ms <= session.time_created < end_ms
         and (include_archived or session.time_archived is None)
     }
@@ -431,6 +439,7 @@ def load_session_excerpts(
         session
         for session in sessions
         if session.parent_id is None
+        and not is_summary_session(session)
         and start_ms <= session.time_created < end_ms
         and (include_archived or session.time_archived is None)
     ]
@@ -658,7 +667,15 @@ Context:
 """
     try:
         completed = subprocess.run(
-            ["opencode", "run", "--format", "json", prompt],
+            [
+                "opencode",
+                "run",
+                "--format",
+                "json",
+                "--title",
+                SUMMARY_SESSION_TITLE,
+                prompt,
+            ],
             capture_output=True,
             text=True,
             timeout=SUMMARY_COMMAND_TIMEOUT,
@@ -819,6 +836,7 @@ def build_report(
         s
         for s in sessions
         if s.parent_id is None
+        and not is_summary_session(s)
         and start_ms <= s.time_created < end_ms
         and (include_archived or s.time_archived is None)
     ]
@@ -872,6 +890,8 @@ def build_todo_report(
     for session_id, items in todos_by_session.items():
         session = by_id.get(session_id)
         if session is None:
+            continue
+        if is_summary_session(session):
             continue
         if not include_archived and session.time_archived is not None:
             continue
