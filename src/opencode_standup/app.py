@@ -72,7 +72,6 @@ PACKAGE_NAME = "opencode-standup"
 GITHUB_OWNER = "RAGessler"
 GITHUB_REPOSITORY = f"{GITHUB_OWNER}/{PACKAGE_NAME}"
 GITHUB_RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
-GITHUB_PACKAGES_URL = f"https://pypi.pkg.github.com/{GITHUB_OWNER}/simple"
 UPDATE_CHECK_TIMEOUT = 3
 UPDATE_CACHE_TTL = 24 * 60 * 60
 SUMMARY_SESSION_TITLE = "opencode-standup AI summary"
@@ -107,6 +106,7 @@ def app_version() -> str:
 class UpdateInfo:
     version: str
     release_url: str
+    asset_url: str
 
 
 def update_cache_path() -> Path:
@@ -164,7 +164,7 @@ def github_credentials() -> tuple[str, str] | None:
     if username and token:
         return username, token
     try:
-        credentials = netrc.netrc().authenticators("pypi.pkg.github.com")
+        credentials = netrc.netrc().authenticators("github.com")
     except (OSError, netrc.NetrcParseError):
         return None
     if credentials is None or not credentials[0] or not credentials[2]:
@@ -185,16 +185,31 @@ def check_for_update(force: bool = False) -> UpdateInfo | None:
         },
     )
     credentials = github_credentials()
-    if credentials is None:
-        return None
-    request.add_header("Authorization", f"Bearer {credentials[1]}")
+    if credentials is not None:
+        request.add_header("Authorization", f"Bearer {credentials[1]}")
     try:
         with urllib.request.urlopen(request, timeout=UPDATE_CHECK_TIMEOUT) as response:
             payload = json.loads(response.read().decode("utf-8"))
         tag_name = payload["tag_name"]
         remote_version = tag_name.removeprefix("v")
         Version(remote_version)
-    except (OSError, KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError, InvalidVersion):
+        wheel = next(
+            asset
+            for asset in payload["assets"]
+            if isinstance(asset, dict)
+            and isinstance(asset.get("name"), str)
+            and asset["name"].endswith(".whl")
+        )
+    except (
+        OSError,
+        KeyError,
+        StopIteration,
+        TypeError,
+        ValueError,
+        UnicodeError,
+        json.JSONDecodeError,
+        InvalidVersion,
+    ):
         return None
     finally:
         mark_update_checked()
@@ -204,44 +219,41 @@ def check_for_update(force: bool = False) -> UpdateInfo | None:
     return UpdateInfo(
         version=remote_version,
         release_url=payload["html_url"],
+        asset_url=wheel["url"],
     )
 
 
-def install_update() -> tuple[bool, str]:
+def install_update(update: UpdateInfo) -> tuple[bool, str]:
     credentials = github_credentials()
-    if credentials is None:
-        return False, "Set OPENCODE_STANDUP_GITHUB_USERNAME and OPENCODE_STANDUP_GITHUB_TOKEN."
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "PIP_INDEX_URL": GITHUB_PACKAGES_URL,
-            "PIP_EXTRA_INDEX_URL": "https://pypi.org/simple",
-            "PIP_DISABLE_PIP_VERSION_CHECK": "1",
-        }
+    request = urllib.request.Request(
+        update.asset_url,
+        headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": f"{PACKAGE_NAME}/{app_version()}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
     )
-    credentials_file = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False)
+    if credentials is not None:
+        request.add_header("Authorization", f"Bearer {credentials[1]}")
+    wheel_path: str | None = None
     try:
-        credentials_file.write(
-            f"machine pypi.pkg.github.com\n"
-            f"  login {credentials[0]}\n"
-            f"  password {credentials[1]}\n"
-        )
-        credentials_file.close()
-        os.chmod(credentials_file.name, 0o600)
-        environment["NETRC"] = credentials_file.name
+        with urllib.request.urlopen(request, timeout=UPDATE_CHECK_TIMEOUT) as response:
+            with tempfile.NamedTemporaryFile(suffix=".whl", delete=False) as wheel_file:
+                wheel_file.write(response.read())
+                wheel_path = wheel_file.name
         completed = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", PACKAGE_NAME],
+            [sys.executable, "-m", "pip", "install", "--upgrade", wheel_path],
             capture_output=True,
             text=True,
             timeout=300,
             check=False,
-            env=environment,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, subprocess.TimeoutExpired, urllib.error.URLError) as exc:
         return False, str(exc)
     finally:
         try:
-            os.unlink(credentials_file.name)
+            if wheel_path is not None:
+                os.unlink(wheel_path)
         except OSError:
             pass
     if completed.returncode != 0:
@@ -1466,11 +1478,14 @@ class StandupApp(App):
                 mark_update_prompted(update.version)
             return
         self.notify("Updating opencode-standup...", timeout=10)
-        self.install_worker = self._install_update_worker()
+        if self._pending_update is None:
+            self.notify("No update is pending.", severity="error")
+            return
+        self.install_worker = self._install_update_worker(self._pending_update)
 
     @work(thread=True, exclusive=True, group="install-update", exit_on_error=False)
-    def _install_update_worker(self) -> tuple[bool, str]:
-        return install_update()
+    def _install_update_worker(self, update: UpdateInfo) -> tuple[bool, str]:
+        return install_update(update)
 
     @on(Worker.StateChanged)
     def _install_worker_changed(self, event: Worker.StateChanged) -> None:

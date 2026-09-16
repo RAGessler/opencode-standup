@@ -13,7 +13,6 @@ on:
 
 permissions:
   contents: write
-  packages: write
 
 jobs:
   publish:
@@ -39,13 +38,11 @@ jobs:
       - run: python -m build
       - run: python -m twine check dist/*
       - run: python scripts/audit_package.py dist/*
-      - name: Publish to GitHub Packages
-        run: >-
-          python -m twine upload
-          --repository-url https://pypi.pkg.github.com/${{ github.repository_owner }}/
-          --username ${{ github.actor }}
-          --password ${{ secrets.GITHUB_TOKEN }}
-          dist/*
+      - name: Store release distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-distributions
+          path: dist/*
 
   github-release:
     needs: publish
@@ -54,9 +51,14 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-distributions
+          path: dist
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag || github.ref_name }}
           release_name: ${{ inputs.release_tag || github.ref_name }}
+          files: dist/*
           draft: false
           prerelease: false

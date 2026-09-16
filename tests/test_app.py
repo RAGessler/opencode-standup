@@ -46,7 +46,7 @@ class MainTests(unittest.TestCase):
     )
     def test_detects_newer_github_release(self, _credentials, urlopen, _version, _mark_checked) -> None:
         response = Mock()
-        response.read.return_value = b'{"tag_name":"v0.2.0","html_url":"https://github.com/RAGessler/opencode-standup/releases/tag/v0.2.0"}'
+        response.read.return_value = b'{"tag_name":"v0.2.0","html_url":"https://github.com/RAGessler/opencode-standup/releases/tag/v0.2.0","assets":[{"name":"opencode_standup-0.2.0-py3-none-any.whl","url":"https://api.github.com/repos/RAGessler/opencode-standup/releases/assets/1"}]}'
         urlopen.return_value.__enter__.return_value = response
 
         self.assertEqual(
@@ -54,12 +54,17 @@ class MainTests(unittest.TestCase):
             UpdateInfo(
                 "0.2.0",
                 "https://github.com/RAGessler/opencode-standup/releases/tag/v0.2.0",
+                "https://api.github.com/repos/RAGessler/opencode-standup/releases/assets/1",
             ),
         )
 
     @patch("opencode_standup.app._read_update_cache", return_value={"prompted_version": "0.2.0"})
     def test_does_not_prompt_for_same_release_twice(self, _cache) -> None:
-        self.assertFalse(should_prompt_for_update(UpdateInfo("0.2.0", "https://example.test")))
+        self.assertFalse(
+            should_prompt_for_update(
+                UpdateInfo("0.2.0", "https://example.test", "https://example.test/asset")
+            )
+        )
 
     @patch.dict(
         "os.environ",
