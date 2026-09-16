@@ -21,26 +21,43 @@ The app reads OpenCode's SQLite database directly. It also starts `opencode serv
 
 ## First-Time Setup
 
-### 1. Install from PyPI
+### 1. Configure GitHub Packages access
 
-For normal use, install the published package with `pipx`. This keeps the tool isolated and lets it update itself without requiring a repository checkout or branch selection.
+The package is private and is published to GitHub Packages. Create a GitHub personal access token (classic) with `read:packages` access. For a package attached to a private repository, the token also needs access to that repository. Use a token dedicated to this tool rather than placing a token in shell history.
+
+Configure pip authentication with `~/.netrc`:
+
+```bash
+cat >> ~/.netrc <<'EOF'
+machine pypi.pkg.github.com
+  login YOUR_GITHUB_USERNAME
+  password YOUR_GITHUB_TOKEN
+EOF
+chmod 600 ~/.netrc
+```
+
+### 2. Install from GitHub Packages
+
+For normal use, install the package with `pipx`. This keeps the tool isolated and lets it update itself without requiring a repository checkout or branch selection.
 
 ```bash
 python3 -m pip install --user pipx
 python3 -m pipx ensurepath
-pipx install opencode-standup
+pipx install --pip-args="--index-url https://pypi.pkg.github.com/RAGessler/simple --extra-index-url https://pypi.org/simple" opencode-standup
 ```
 
-If `pipx` is not available, install it into a dedicated virtual environment instead:
+The package dependencies are resolved from public PyPI. The `~/.netrc` entry authenticates only the GitHub Packages registry.
+
+The TUI can use the same `~/.netrc` entry for update checks and upgrades. Alternatively, set these variables so the TUI can authenticate directly:
 
 ```bash
-python3 -m venv ~/.local/share/opencode-standup/venv
-~/.local/share/opencode-standup/venv/bin/python -m pip install opencode-standup
-mkdir -p ~/.local/bin
-ln -sf ~/.local/share/opencode-standup/venv/bin/opencode-standup ~/.local/bin/opencode-standup
+export OPENCODE_STANDUP_GITHUB_USERNAME=YOUR_GITHUB_USERNAME
+export OPENCODE_STANDUP_GITHUB_TOKEN=YOUR_GITHUB_TOKEN
 ```
 
-### 2. Check prerequisites
+Put them in your shell profile if desired. The token is sent only to GitHub APIs and is never included in the update URL or displayed in the TUI.
+
+### 3. Check prerequisites
 
 ```bash
 python3 --version
@@ -58,7 +75,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Add the same line to `~/.zshrc` or `~/.bashrc` to make it permanent, then open a new terminal or reload the file.
 
-### 3. Launch it
+### 4. Launch it
 
 ```bash
 opencode-standup
@@ -118,15 +135,15 @@ OPENCODE_STANDUP_JIRA_TIMEOUT=20
 
 ## Updating
 
-The TUI checks PyPI for a newer release once per day in the background. It does not block startup if the network is unavailable. When a release is available, the TUI shows the current and available versions and asks for confirmation before upgrading.
+The TUI checks the latest GitHub Release once per day in the background. It does not block startup if GitHub is unavailable or credentials are missing. When a release is available, the TUI shows the current and available versions and asks for confirmation before upgrading.
 
 You can also update manually:
 
 ```bash
-pipx upgrade opencode-standup
+pipx upgrade --pip-args="--index-url https://pypi.pkg.github.com/RAGessler/simple --extra-index-url https://pypi.org/simple" opencode-standup
 ```
 
-Press `U` in the TUI to check immediately for updates. The update check only requests public package metadata from PyPI; it does not upload OpenCode sessions, transcripts, Jira data, or credentials.
+Press `U` in the TUI to check immediately for updates. The update check requests release metadata from GitHub and the upgrade downloads the package from GitHub Packages. It does not upload OpenCode sessions, transcripts, or Jira data.
 
 The legacy `scripts/install.sh` remains available for development from a source checkout. It installs that checkout in editable mode and is not the normal end-user installation path.
 
@@ -212,6 +229,6 @@ rm -rf dist build
 .venv/bin/python scripts/audit_package.py dist/*
 ```
 
-Releases are created by pushing a version tag such as `v0.2.0`. GitHub Actions runs tests, audits the artifacts, and publishes them to PyPI using trusted publishing. Configure the PyPI project’s trusted publisher for this repository and the `pypi` GitHub environment before pushing the first release tag.
+Releases are created by pushing a version tag such as `v0.2.0`. GitHub Actions runs tests, audits the artifacts, publishes them to GitHub Packages using the workflow token, and creates a GitHub Release. Consumers need a GitHub token with package read access to install and update the package.
 
 The application requires a real OpenCode database to launch the interactive TUI. Use `--db` to point it at a test database when validating locally.

@@ -22,6 +22,7 @@ from opencode_standup.app import (
     is_summary_session,
     UpdateInfo,
     check_for_update,
+    github_credentials,
     should_prompt_for_update,
     main,
     SessionRow,
@@ -39,19 +40,37 @@ class MainTests(unittest.TestCase):
     @patch("opencode_standup.app.mark_update_checked")
     @patch("opencode_standup.app.app_version", return_value="0.1.0")
     @patch("opencode_standup.app.urllib.request.urlopen")
-    def test_detects_newer_pypi_version(self, urlopen, _version, _mark_checked) -> None:
+    @patch(
+        "opencode_standup.app.github_credentials",
+        return_value=("octocat", "secret-token"),
+    )
+    def test_detects_newer_github_release(self, _credentials, urlopen, _version, _mark_checked) -> None:
         response = Mock()
-        response.read.return_value = b'{"info":{"version":"0.2.0"}}'
+        response.read.return_value = b'{"tag_name":"v0.2.0","html_url":"https://github.com/RAGessler/opencode-standup/releases/tag/v0.2.0"}'
         urlopen.return_value.__enter__.return_value = response
 
         self.assertEqual(
             check_for_update(force=True),
-            UpdateInfo("0.2.0", "https://pypi.org/project/opencode-standup/0.2.0/"),
+            UpdateInfo(
+                "0.2.0",
+                "https://github.com/RAGessler/opencode-standup/releases/tag/v0.2.0",
+            ),
         )
 
     @patch("opencode_standup.app._read_update_cache", return_value={"prompted_version": "0.2.0"})
     def test_does_not_prompt_for_same_release_twice(self, _cache) -> None:
         self.assertFalse(should_prompt_for_update(UpdateInfo("0.2.0", "https://example.test")))
+
+    @patch.dict(
+        "os.environ",
+        {
+            "OPENCODE_STANDUP_GITHUB_USERNAME": "octocat",
+            "OPENCODE_STANDUP_GITHUB_TOKEN": "secret-token",
+        },
+        clear=False,
+    )
+    def test_reads_github_credentials_from_environment(self) -> None:
+        self.assertEqual(github_credentials(), ("octocat", "secret-token"))
 
     def test_summary_sessions_are_excluded_from_reports(self) -> None:
         normal = SessionRow(

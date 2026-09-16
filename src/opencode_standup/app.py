@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+import netrc
 import os
 import re
 import shutil
@@ -34,6 +35,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -67,7 +69,10 @@ from textual.worker import Worker, WorkerState
 
 DEFAULT_DB_PATH = os.path.expanduser("~/.local/share/opencode/opencode.db")
 PACKAGE_NAME = "opencode-standup"
-PYPI_METADATA_URL = "https://pypi.org/pypi/opencode-standup/json"
+GITHUB_OWNER = "RAGessler"
+GITHUB_REPOSITORY = f"{GITHUB_OWNER}/{PACKAGE_NAME}"
+GITHUB_RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
+GITHUB_PACKAGES_URL = f"https://pypi.pkg.github.com/{GITHUB_OWNER}/simple"
 UPDATE_CHECK_TIMEOUT = 3
 UPDATE_CACHE_TTL = 24 * 60 * 60
 SUMMARY_SESSION_TITLE = "opencode-standup AI summary"
@@ -153,18 +158,41 @@ def should_prompt_for_update(update: UpdateInfo | None) -> bool:
     return prompted_version != update.version
 
 
+def github_credentials() -> tuple[str, str] | None:
+    username = os.environ.get("OPENCODE_STANDUP_GITHUB_USERNAME")
+    token = os.environ.get("OPENCODE_STANDUP_GITHUB_TOKEN")
+    if username and token:
+        return username, token
+    try:
+        credentials = netrc.netrc().authenticators("pypi.pkg.github.com")
+    except (OSError, netrc.NetrcParseError):
+        return None
+    if credentials is None or not credentials[0] or not credentials[2]:
+        return None
+    return credentials[0], credentials[2]
+
+
 def check_for_update(force: bool = False) -> UpdateInfo | None:
     if not force and not should_check_for_update():
         return None
 
     request = urllib.request.Request(
-        PYPI_METADATA_URL,
-        headers={"Accept": "application/json", "User-Agent": f"{PACKAGE_NAME}/{app_version()}",},
+        GITHUB_RELEASES_URL,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"{PACKAGE_NAME}/{app_version()}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
     )
+    credentials = github_credentials()
+    if credentials is None:
+        return None
+    request.add_header("Authorization", f"Bearer {credentials[1]}")
     try:
         with urllib.request.urlopen(request, timeout=UPDATE_CHECK_TIMEOUT) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        remote_version = payload["info"]["version"]
+        tag_name = payload["tag_name"]
+        remote_version = tag_name.removeprefix("v")
         Version(remote_version)
     except (OSError, KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError, InvalidVersion):
         return None
@@ -175,21 +203,47 @@ def check_for_update(force: bool = False) -> UpdateInfo | None:
         return None
     return UpdateInfo(
         version=remote_version,
-        release_url=f"https://pypi.org/project/{PACKAGE_NAME}/{remote_version}/",
+        release_url=payload["html_url"],
     )
 
 
 def install_update() -> tuple[bool, str]:
+    credentials = github_credentials()
+    if credentials is None:
+        return False, "Set OPENCODE_STANDUP_GITHUB_USERNAME and OPENCODE_STANDUP_GITHUB_TOKEN."
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PIP_INDEX_URL": GITHUB_PACKAGES_URL,
+            "PIP_EXTRA_INDEX_URL": "https://pypi.org/simple",
+            "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        }
+    )
+    credentials_file = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False)
     try:
+        credentials_file.write(
+            f"machine pypi.pkg.github.com\n"
+            f"  login {credentials[0]}\n"
+            f"  password {credentials[1]}\n"
+        )
+        credentials_file.close()
+        os.chmod(credentials_file.name, 0o600)
+        environment["NETRC"] = credentials_file.name
         completed = subprocess.run(
             [sys.executable, "-m", "pip", "install", "--upgrade", PACKAGE_NAME],
             capture_output=True,
             text=True,
             timeout=300,
             check=False,
+            env=environment,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
+    finally:
+        try:
+            os.unlink(credentials_file.name)
+        except OSError:
+            pass
     if completed.returncode != 0:
         return False, completed.stderr.strip() or "pip exited unsuccessfully"
     return True, completed.stdout.strip() or "Updated successfully."
