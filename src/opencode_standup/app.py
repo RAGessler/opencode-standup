@@ -6,8 +6,8 @@ A daily command-center for opencode sessions across all your repos:
   - Standup tab: sessions grouped by project for a chosen time scope
     (Today / Last workday / This week / All time), with cost & token
     rollups (including subagent spend).
-  - Todo tab: outstanding (non-completed) todo items across all sessions,
-    so you can see what's left to pick back up without hunting repo by repo.
+  - GitHub tab: your opened, authored-and-merged, reviewed, and commented
+    pull requests for the same time scope.
 
 Actions (see the in-app help with `?`):
   e  rename the selected task/session (via opencode's REST API)
@@ -17,7 +17,8 @@ Actions (see the in-app help with `?`):
      opencode's API does not currently expose an "unarchive" operation
   o  open/resume the selected session in the real opencode TUI
   1-5  switch time scope (Standup tab)
-  [ ]  switch tabs
+  [ ]  switch between the Standup and GitHub tabs
+  c  set up GitHub credentials
   r  refresh
   q  quit
 """
@@ -38,11 +39,12 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 
@@ -72,8 +74,19 @@ PACKAGE_NAME = "opencode-standup"
 GITHUB_OWNER = "RAGessler"
 GITHUB_REPOSITORY = f"{GITHUB_OWNER}/{PACKAGE_NAME}"
 GITHUB_RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
+GITHUB_USER_URL = "https://api.github.com/user"
+GITHUB_SEARCH_URL = "https://api.github.com/search/issues"
+GITHUB_ACTIVITY_ORG = "ShamrockTrading"
+GITHUB_ORGANIZATION_REPOSITORIES_URL = f"https://api.github.com/orgs/{GITHUB_ACTIVITY_ORG}/repos"
 UPDATE_CHECK_TIMEOUT = 3
 UPDATE_CACHE_TTL = 24 * 60 * 60
+GITHUB_ACTIVITY_TIMEOUT = 15
+GITHUB_ACTIVITY_LIMIT = 100
+GITHUB_ACTIVITY_MAX_DAYS = 366
+GITHUB_ACTIVITY_CACHE_TTL = 5 * 60
+GITHUB_SUMMARY_ACTIVITY_LIMIT = 40
+GITHUB_SUMMARY_MAX_CHARS = 4000
+GITHUB_TOKEN_URL = "https://github.com/settings/tokens/new?scopes=repo&description=opencode-standup"
 SUMMARY_SESSION_TITLE = "opencode-standup AI summary"
 LEGACY_SUMMARY_TITLE_PREFIX = "Create a factual standup summary for"
 
@@ -107,6 +120,39 @@ class UpdateInfo:
     version: str
     release_url: str
     asset_url: str
+
+
+class GitHubActivityError(RuntimeError):
+    pass
+
+
+_github_activity_cache: dict[tuple[str, str, date | None], tuple[float, GitHubActivityResult]] = {}
+
+
+class GitHubActivityKind(Enum):
+    OPENED = "opened"
+    MERGED = "merged"
+    REVIEWED = "reviewed"
+    COMMENTED = "commented"
+
+
+@dataclass(frozen=True)
+class GitHubActivity:
+    kind: GitHubActivityKind
+    repository: str
+    number: int
+    title: str
+    url: str
+    occurred_at: str
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class GitHubActivityResult:
+    activities: tuple[GitHubActivity, ...] = ()
+    available: bool = True
+    error: str | None = None
+    login: str | None = None
 
 
 def update_cache_path() -> Path:
@@ -158,6 +204,51 @@ def should_prompt_for_update(update: UpdateInfo | None) -> bool:
     return prompted_version != update.version
 
 
+def github_credentials_path() -> Path:
+    config_root = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+    return Path(config_root) / PACKAGE_NAME / "github.json"
+
+
+def _read_saved_github_credentials() -> tuple[str, str] | None:
+    path = github_credentials_path()
+    try:
+        if not path.is_file() or path.stat().st_mode & 0o077:
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    username = payload.get("username")
+    token = payload.get("token")
+    if not isinstance(username, str) or not isinstance(token, str) or not username or not token:
+        return None
+    return username, token
+
+
+def save_github_credentials(username: str, token: str) -> None:
+    path = github_credentials_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    temporary_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix="github-", delete=False
+        ) as credentials_file:
+            json.dump({"username": username, "token": token}, credentials_file)
+            credentials_file.write("\n")
+            credentials_file.flush()
+            os.fchmod(credentials_file.fileno(), 0o600)
+            temporary_path = credentials_file.name
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+
+
 def github_credentials() -> tuple[str, str] | None:
     username = os.environ.get("OPENCODE_STANDUP_GITHUB_USERNAME")
     token = os.environ.get("OPENCODE_STANDUP_GITHUB_TOKEN")
@@ -166,10 +257,383 @@ def github_credentials() -> tuple[str, str] | None:
     try:
         credentials = netrc.netrc().authenticators("github.com")
     except (OSError, netrc.NetrcParseError):
+        credentials = None
+    if credentials is not None and credentials[0] and credentials[2]:
+        return credentials[0], credentials[2]
+    return _read_saved_github_credentials()
+
+
+def github_request_headers(token: str) -> dict[str, str]:
+    return {
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "User-Agent": f"{PACKAGE_NAME}/{app_version()}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Authorization": f"Bearer {token}",
+    }
+
+
+def validate_github_credentials(credentials: tuple[str, str]) -> tuple[bool, str]:
+    request = urllib.request.Request(
+        GITHUB_USER_URL,
+        headers=github_request_headers(credentials[1]),
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=GITHUB_ACTIVITY_TIMEOUT) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return False, "GitHub rejected this token. Check that it is valid and has not expired."
+        if exc.code == 403:
+            return False, "GitHub denied the request or rate-limited the token."
+        return False, f"GitHub returned HTTP {exc.code}."
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return False, f"Could not validate the GitHub token: {exc}"
+    login = payload.get("login") if isinstance(payload, dict) else None
+    if not isinstance(login, str) or not login:
+        return False, "GitHub returned an unexpected identity response."
+    try:
+        _github_organization_access(github_request_headers(credentials[1]))
+    except (OSError, UnicodeError, json.JSONDecodeError, GitHubActivityError) as exc:
+        return False, str(exc)
+    return True, login
+
+
+def _github_error_message(exc: urllib.error.HTTPError, operation: str) -> str:
+    try:
+        payload = json.loads(exc.read().decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        payload = {}
+    detail = payload.get("message") if isinstance(payload, dict) else None
+    if exc.code == 401:
+        return "GitHub authentication failed. Check your token."
+    if exc.code == 403:
+        if isinstance(detail, str) and "rate limit" in detail.casefold():
+            reset = exc.headers.get("X-RateLimit-Reset") if exc.headers else None
+            if isinstance(reset, str) and reset.isdigit():
+                when = datetime.fromtimestamp(int(reset)).astimezone().strftime("%H:%M")
+                return f"GitHub rate limit reached; try again after {when}."
+            return "GitHub rate limit reached; try again later."
+        return (
+            f"GitHub denied {operation}. Ensure the token can read private "
+            f"{GITHUB_ACTIVITY_ORG} repositories and is SSO-authorized."
+        )
+    suffix = f": {detail}" if isinstance(detail, str) and detail else ""
+    return f"GitHub {operation} failed (HTTP {exc.code}){suffix}"
+
+
+def _github_get_json(url: str, headers: dict[str, str], operation: str) -> object:
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=GITHUB_ACTIVITY_TIMEOUT) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise GitHubActivityError(_github_error_message(exc, operation)) from exc
+
+
+def _github_organization_access(headers: dict[str, str]) -> None:
+    payload = _github_get_json(
+        f"{GITHUB_ORGANIZATION_REPOSITORIES_URL}?{urllib.parse.urlencode({'type': 'all', 'per_page': 1})}",
+        headers,
+        f"{GITHUB_ACTIVITY_ORG} repository access",
+    )
+    if not isinstance(payload, list):
+        raise GitHubActivityError("GitHub returned an unexpected repository access response.")
+    if not payload:
+        raise GitHubActivityError(
+            f"GitHub cannot access private {GITHUB_ACTIVITY_ORG} repositories. Ensure the token "
+            "has repository access and is SSO-authorized."
+        )
+
+
+def _github_iso_datetime(value: str | None) -> datetime | None:
+    if not value or not isinstance(value, str):
         return None
-    if credentials is None or not credentials[0] or not credentials[2]:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
         return None
-    return credentials[0], credentials[2]
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _github_scope_dates(scope: Scope) -> tuple[str, str]:
+    start_ms, end_ms = scope.bounds_ms()
+    start = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+    end = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    start = max(start, now - timedelta(days=GITHUB_ACTIVITY_MAX_DAYS))
+    end = min(end, now)
+    return start.isoformat().replace("+00:00", "Z"), end.isoformat().replace("+00:00", "Z")
+
+
+def _github_activity_from_pull_request(
+    kind: GitHubActivityKind,
+    pull_request: object,
+    occurred_at: str,
+    detail: str = "",
+) -> GitHubActivity | None:
+    if not isinstance(pull_request, dict):
+        return None
+    repository = pull_request.get("repository")
+    if not isinstance(repository, dict):
+        return None
+    number = pull_request.get("number")
+    title = pull_request.get("title")
+    url = pull_request.get("url")
+    name = repository.get("nameWithOwner")
+    if not isinstance(number, int) or not all(isinstance(value, str) and value for value in (title, url, name)):
+        return None
+    if not name.split("/", 1)[0].casefold() == GITHUB_ACTIVITY_ORG.casefold():
+        return None
+    return GitHubActivity(kind, name, number, title, url, occurred_at, detail)
+
+
+def _github_scope_dates_for_search(scope: Scope) -> tuple[str, str]:
+    start, end = _github_scope_dates(scope)
+    end_date = (datetime.fromisoformat(end.replace("Z", "+00:00")) - timedelta(microseconds=1)).date()
+    return start[:10], end_date.isoformat()
+
+
+def _github_search_url(query: str, per_page: int) -> str:
+    return f"{GITHUB_SEARCH_URL}?{urllib.parse.urlencode({'q': query, 'per_page': per_page, 'sort': 'updated', 'order': 'desc'})}"
+
+
+def _github_search_items(
+    query: str, headers: dict[str, str], limit: int, operation: str
+) -> list[dict[str, object]]:
+    payload = _github_get_json(_github_search_url(query, limit), headers, operation)
+    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+        raise GitHubActivityError("GitHub returned an unexpected search response.")
+    return [item for item in payload["items"][:limit] if isinstance(item, dict)]
+
+
+def _github_in_scope(value: str | None, scope: Scope) -> bool:
+    timestamp = _github_iso_datetime(value)
+    if timestamp is None:
+        return False
+    start_ms, end_ms = scope.bounds_ms()
+    timestamp_ms = int(timestamp.timestamp() * 1000)
+    return start_ms <= timestamp_ms < end_ms
+
+
+def _github_add_activity(
+    activities: dict[tuple[str, str, int, str], GitHubActivity],
+    kind: GitHubActivityKind,
+    pull_request: object,
+    occurred_at: str | None,
+    detail: str = "",
+) -> None:
+    if not isinstance(occurred_at, str):
+        return
+    activity = _github_activity_from_pull_request(kind, pull_request, occurred_at, detail)
+    if activity:
+        activities[(activity.kind.value, activity.repository, activity.number, activity.occurred_at)] = activity
+
+
+def _github_pr_from_search_item(item: dict[str, object]) -> dict[str, object]:
+    repository = item.get("repository")
+    full_name = repository.get("full_name") if isinstance(repository, dict) else None
+    if not isinstance(full_name, str):
+        repository_url = item.get("repository_url")
+        full_name = repository_url.removeprefix("https://api.github.com/repos/") if isinstance(repository_url, str) else None
+    return {
+        "number": item.get("number"),
+        "title": item.get("title"),
+        "url": item.get("html_url"),
+        "repository": {"nameWithOwner": full_name},
+    }
+
+
+def _github_pr_from_item_with_comments(item: dict[str, object]) -> dict[str, object]:
+    pull_request = _github_pr_from_search_item(item)
+    if not pull_request["repository"]["nameWithOwner"]:
+        repository = item.get("repository")
+        if isinstance(repository, dict):
+            pull_request["repository"] = {"nameWithOwner": repository.get("full_name")}
+    return pull_request
+
+
+def load_github_review_activities(
+    login: str, scope: Scope, headers: dict[str, str]
+) -> tuple[GitHubActivity, ...]:
+    start_date, end_date = _github_scope_dates_for_search(scope)
+    items = _github_search_items(
+        f"org:{GITHUB_ACTIVITY_ORG} is:pr reviewed-by:{login} updated:{start_date}..{end_date}",
+        headers,
+        GITHUB_ACTIVITY_LIMIT,
+        "reviewed pull request search",
+    )
+    activities: dict[tuple[str, str, int, str], GitHubActivity] = {}
+    for item in items:
+        repository = item.get("repository_url")
+        number = item.get("number")
+        if not isinstance(repository, str) or not isinstance(number, int):
+            continue
+        reviews_url = f"{repository}/pulls/{number}/reviews"
+        reviews = _github_get_json(
+            f"{reviews_url}?{urllib.parse.urlencode({'per_page': 100})}", headers, "pull request reviews"
+        )
+        if not isinstance(reviews, list):
+            raise GitHubActivityError("GitHub returned an unexpected reviews response.")
+        for review in reviews:
+            if not isinstance(review, dict):
+                continue
+            author = review.get("user")
+            submitted_at = review.get("submitted_at")
+            if not isinstance(author, dict) or author.get("login") != login:
+                continue
+            if not _github_in_scope(submitted_at, scope):
+                continue
+            _github_add_activity(
+                activities,
+                GitHubActivityKind.REVIEWED,
+                _github_pr_from_search_item(item),
+                submitted_at,
+                str(review.get("state", "Review")),
+            )
+    return tuple(sorted(activities.values(), key=lambda item: item.occurred_at, reverse=True))
+
+
+def parse_github_comment_search(payload: object, scope: Scope, login: str) -> tuple[GitHubActivity, ...]:
+    if not isinstance(payload, dict):
+        raise GitHubActivityError("GitHub returned an unexpected comment response.")
+    items = payload.get("items")
+    if not isinstance(items, list):
+        raise GitHubActivityError("GitHub returned an unexpected comment response.")
+    start_ms, end_ms = scope.bounds_ms()
+    activities: dict[tuple[str, str, int, str], GitHubActivity] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        comments = item.get("comments", [])
+        if not isinstance(comments, list):
+            continue
+        for comment in comments:
+            if not isinstance(comment, dict):
+                continue
+            author = comment.get("user")
+            occurred_at = comment.get("created_at")
+            if not isinstance(author, dict) or author.get("login") != login:
+                continue
+            timestamp = _github_iso_datetime(occurred_at)
+            if timestamp is None:
+                continue
+            timestamp_ms = int(timestamp.timestamp() * 1000)
+            if not start_ms <= timestamp_ms < end_ms:
+                continue
+            activity = _github_activity_from_pull_request(
+                GitHubActivityKind.COMMENTED,
+                {
+                    "number": item.get("number"),
+                    "title": item.get("title"),
+                    "url": item.get("html_url"),
+                "repository": {
+                    "nameWithOwner": (
+                        item.get("repository", {}).get("full_name")
+                        if isinstance(item.get("repository"), dict)
+                        else None
+                    )
+                },
+                },
+                occurred_at,
+                "Commented",
+            )
+            if activity:
+                activities[(activity.kind.value, activity.repository, activity.number, activity.occurred_at)] = activity
+    return tuple(sorted(activities.values(), key=lambda item: item.occurred_at, reverse=True))
+
+
+def load_github_comments(
+    login: str, scope: Scope, headers: dict[str, str]
+) -> tuple[GitHubActivity, ...]:
+    start, end = _github_scope_dates(scope)
+    start_date = start[:10]
+    end_date = (datetime.fromisoformat(end.replace("Z", "+00:00")) - timedelta(microseconds=1)).date()
+    items = _github_search_items(
+        f"org:{GITHUB_ACTIVITY_ORG} commenter:{login} is:pr updated:{start_date}..{end_date}",
+        headers,
+        GITHUB_ACTIVITY_LIMIT,
+        "pull request conversation comment search",
+    )
+    items_with_comments: list[dict[str, object]] = []
+    for item in items:
+        comments_url = item.get("comments_url")
+        if not isinstance(comments_url, str):
+            continue
+        comments = _github_get_json(
+            f"{comments_url}?{urllib.parse.urlencode({'per_page': 100})}",
+            headers,
+            "pull request conversation comments",
+        )
+        item_with_comments = dict(item)
+        item_with_comments["comments"] = comments
+        items_with_comments.append(item_with_comments)
+    return parse_github_comment_search({"items": items_with_comments}, scope, login)
+
+
+def load_github_activity(
+    scope: Scope,
+    force_refresh: bool = False,
+    credentials: tuple[str, str] | None = None,
+) -> GitHubActivityResult:
+    credentials = credentials or github_credentials()
+    if credentials is None:
+        return GitHubActivityResult(available=False, error="GitHub credentials are not configured.")
+    headers = github_request_headers(credentials[1])
+    try:
+        user_payload = _github_get_json(GITHUB_USER_URL, headers, "authenticated user lookup")
+        login = user_payload.get("login") if isinstance(user_payload, dict) else None
+        if not isinstance(login, str) or not login:
+            raise GitHubActivityError("GitHub did not return the authenticated user.")
+        cache_key = (login, scope.kind.value, scope.custom_date)
+        cached = _github_activity_cache.get(cache_key)
+        if not force_refresh and cached and time.monotonic() - cached[0] < GITHUB_ACTIVITY_CACHE_TTL:
+            return cached[1]
+        _github_organization_access(headers)
+
+        start_date, end_date = _github_scope_dates_for_search(scope)
+        activities: dict[tuple[str, str, int, str], GitHubActivity] = {}
+        opened_items = _github_search_items(
+            f"org:{GITHUB_ACTIVITY_ORG} is:pr author:{login} created:{start_date}..{end_date}",
+            headers,
+            GITHUB_ACTIVITY_LIMIT,
+            "opened pull request search",
+        )
+        for item in opened_items:
+            created_at = item.get("created_at")
+            if _github_in_scope(created_at, scope):
+                _github_add_activity(activities, GitHubActivityKind.OPENED, _github_pr_from_search_item(item), created_at)
+
+        merged_items = _github_search_items(
+            f"org:{GITHUB_ACTIVITY_ORG} is:pr is:merged author:{login} updated:{start_date}..{end_date}",
+            headers,
+            GITHUB_ACTIVITY_LIMIT,
+            "merged pull request search",
+        )
+        for item in merged_items:
+            pull_request_url = item.get("pull_request", {}).get("url") if isinstance(item.get("pull_request"), dict) else None
+            if not isinstance(pull_request_url, str):
+                continue
+            detail = _github_get_json(pull_request_url, headers, "pull request details")
+            merged_at = detail.get("merged_at") if isinstance(detail, dict) else None
+            if _github_in_scope(merged_at, scope):
+                _github_add_activity(activities, GitHubActivityKind.MERGED, _github_pr_from_search_item(item), merged_at, "Merged")
+
+        for activity in load_github_review_activities(login, scope, headers):
+            activities[(activity.kind.value, activity.repository, activity.number, activity.occurred_at)] = activity
+        comments = load_github_comments(login, scope, headers)
+        for activity in comments:
+            activities[(activity.kind.value, activity.repository, activity.number, activity.occurred_at)] = activity
+        result = GitHubActivityResult(
+            tuple(sorted(activities.values(), key=lambda item: item.occurred_at, reverse=True)),
+            True,
+            None,
+            login,
+        )
+        _github_activity_cache[cache_key] = (time.monotonic(), result)
+        return result
+    except (OSError, UnicodeError, json.JSONDecodeError, GitHubActivityError) as exc:
+        return GitHubActivityResult(available=False, error=str(exc))
 
 
 def check_for_update(force: bool = False) -> UpdateInfo | None:
@@ -368,15 +832,6 @@ class SessionRow:
 
 
 @dataclass
-class TodoItem:
-    session_id: str
-    content: str
-    status: str
-    priority: str
-    position: int
-
-
-@dataclass
 class TaskTotals:
     cost: float = 0.0
     tokens_input: int = 0
@@ -441,13 +896,6 @@ class ProjectGroup:
         return agg
 
 
-@dataclass
-class TodoProjectGroup:
-    name: str
-    # session -> list of todo items
-    sessions: list[tuple[SessionRow, list[TodoItem]]] = field(default_factory=list)
-
-
 @dataclass(frozen=True)
 class JiraIssue:
     key: str
@@ -463,6 +911,9 @@ class SummaryContext:
     jira_issues: tuple[JiraIssue, ...]
     jira_available: bool
     jira_error: str | None = None
+    github_activities: tuple[GitHubActivity, ...] = ()
+    github_available: bool = True
+    github_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -470,6 +921,8 @@ class SummaryResult:
     text: str
     jira_available: bool
     jira_error: str | None = None
+    github_available: bool = True
+    github_error: str | None = None
 
 
 class SummaryGenerationError(RuntimeError):
@@ -541,31 +994,6 @@ def load_project_names(db_path: str) -> dict[str, str]:
         r["id"]: (r["name"] or os.path.basename(r["worktree"].rstrip("/")) or r["worktree"])
         for r in rows
     }
-
-
-def load_open_todos(db_path: str) -> list[TodoItem]:
-    conn = _ro_connect(db_path)
-    try:
-        rows = conn.execute(
-            """
-            SELECT session_id, content, status, priority, position
-            FROM todo
-            WHERE status NOT IN ('completed', 'cancelled')
-            ORDER BY session_id, position
-            """
-        ).fetchall()
-    finally:
-        conn.close()
-    return [
-        TodoItem(
-            session_id=r["session_id"],
-            content=r["content"],
-            status=r["status"],
-            priority=r["priority"],
-            position=r["position"],
-        )
-        for r in rows
-    ]
 
 
 def extract_jira_keys(text: str) -> set[str]:
@@ -792,6 +1220,7 @@ def build_summary_context(
         db_path, sessions, project_names, scope, include_archived
     )
     jira_issues, jira_available, jira_error = load_jira_context(workday)
+    github_result = load_github_activity(scope)
     by_key = {issue.key.upper(): issue for issue in jira_issues}
     for key in sorted(chat_keys):
         by_key.setdefault(key, JiraIssue(key=key))
@@ -800,15 +1229,31 @@ def build_summary_context(
         f" [{issue.status}] {issue.url}".strip()
         for issue in by_key.values()
     )
+    github_lines = [
+        f"{activity.kind.value}: {activity.repository}#{activity.number} {activity.title} "
+        f"[{activity.detail or 'activity'}] {activity.url}"
+        for activity in github_result.activities[:GITHUB_SUMMARY_ACTIVITY_LIMIT]
+    ]
+    github_omission = "\n(additional GitHub activity omitted)"
+    github_text = _clip(
+        "\n".join(github_lines),
+        GITHUB_SUMMARY_MAX_CHARS - (len(github_omission) if len(github_result.activities) > len(github_lines) else 0),
+    )
+    if len(github_result.activities) > len(github_lines):
+        github_text += github_omission
     return SummaryContext(
         workday=workday,
         text=(
             f"OpenCode work:\n{transcript}\n\n"
-            f"Jira context:\n{jira_text or '(none)'}"
+            f"Jira context:\n{jira_text or '(none)'}\n\n"
+            f"GitHub activity:\n{github_text or '(none)'}"
         ),
         jira_issues=tuple(by_key.values()),
         jira_available=jira_available,
         jira_error=jira_error,
+        github_activities=github_result.activities,
+        github_available=github_result.available,
+        github_error=github_result.error,
     )
 
 
@@ -836,6 +1281,11 @@ def generate_summary(context: SummaryContext) -> str:
         if not context.jira_available
         else "Jira activity was available and may be used when supported by the context."
     )
+    github_note = (
+        "GitHub activity was unavailable; do not infer GitHub work."
+        if not context.github_available
+        else "GitHub activity was available and may be used when supported by the context."
+    )
     prompt = f"""Create a factual standup summary for {context.workday.isoformat()}.
 
 Output exactly:
@@ -846,6 +1296,7 @@ Use only the supplied context. Do not invent work, ticket details, blockers, or 
 Mention uncertainty when evidence is incomplete. Include Jira keys and links when supplied.
 Do not call tools or inspect files; answer directly from this context.
 {jira_note}
+{github_note}
 
 Context:
 {context.text}
@@ -888,6 +1339,8 @@ def generate_last_workday_summary(db_path: str, include_archived: bool) -> Summa
         text=generate_summary(context),
         jira_available=context.jira_available,
         jira_error=context.jira_error,
+        github_available=context.github_available,
+        github_error=context.github_error,
     )
 
 
@@ -1060,40 +1513,6 @@ def build_report(
     return ordered
 
 
-def build_todo_report(
-    sessions: list[SessionRow],
-    todos: list[TodoItem],
-    project_names: dict[str, str],
-    include_archived: bool = False,
-) -> list[TodoProjectGroup]:
-    by_id = {s.id: s for s in sessions}
-    todos_by_session: dict[str, list[TodoItem]] = defaultdict(list)
-    for t in todos:
-        todos_by_session[t.session_id].append(t)
-
-    groups: dict[str, TodoProjectGroup] = {}
-    for session_id, items in todos_by_session.items():
-        session = by_id.get(session_id)
-        if session is None:
-            continue
-        if is_summary_session(session):
-            continue
-        if not include_archived and session.time_archived is not None:
-            continue
-        project_label = (
-            project_names.get(session.project_id)
-            or os.path.basename(session.directory.rstrip("/"))
-            or session.directory
-        )
-        group = groups.setdefault(project_label, TodoProjectGroup(name=project_label))
-        group.sessions.append((session, sorted(items, key=lambda i: i.position)))
-
-    ordered = sorted(groups.values(), key=lambda g: g.name.lower())
-    for g in ordered:
-        g.sessions.sort(key=lambda pair: pair[0].time_created, reverse=True)
-    return ordered
-
-
 # --------------------------------------------------------------------------
 # Rendering helpers
 # --------------------------------------------------------------------------
@@ -1117,9 +1536,6 @@ def fmt_time(ms: int) -> str:
 
 def fmt_date(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000).strftime("%b %d")
-
-
-PRIORITY_COLOR = {"high": "red", "medium": "yellow", "low": "dim"}
 
 
 # --------------------------------------------------------------------------
@@ -1274,6 +1690,75 @@ class UpdateModal(ModalScreen[str | None]):
             self.dismiss("update")
 
 
+class GitHubSetupModal(ModalScreen[str | None]):
+    CSS = """
+    GitHubSetupModal {
+        align: center middle;
+    }
+    #dialog {
+        width: 82;
+        height: auto;
+        padding: 1 2;
+        border: thick $accent;
+        background: $surface;
+    }
+    #instructions {
+        margin-bottom: 1;
+    }
+    #dialog Label {
+        margin-top: 1;
+    }
+    #buttons {
+        height: auto;
+        align: center middle;
+        margin-top: 1;
+    }
+    #buttons Button {
+        margin: 0 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Container(id="dialog"):
+            yield Static(
+                "GitHub setup\n\n"
+                "Create a GitHub personal access token with repository read access. "
+                "The token is validated with GitHub and stored locally with restricted permissions. "
+                "The token itself is never displayed after setup.",
+                id="instructions",
+            )
+            yield Label("Personal access token")
+            yield Input(placeholder="github_pat_...", password=True, id="github-token")
+            with Container(id="buttons"):
+                yield Button("Open GitHub token settings", id="open-github-token")
+                yield Button("Save and validate", id="save", variant="success")
+                yield Button("Cancel", id="cancel", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#github-token", Input).focus()
+
+    @on(Button.Pressed, "#open-github-token")
+    def open_github_token_settings(self) -> None:
+        webbrowser.open(GITHUB_TOKEN_URL)
+
+    @on(Button.Pressed, "#save")
+    def save(self) -> None:
+        token = self.query_one("#github-token", Input).value.strip()
+        self.dismiss(token or None)
+
+    @on(Input.Submitted, "#github-token")
+    def submit(self, event: Input.Submitted) -> None:
+        self.save()
+
+    @on(Button.Pressed, "#cancel")
+    def cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            self.dismiss(None)
+
+
 HELP_TEXT = """\
 [b]opencode-standup — keybindings[/b]
 
@@ -1281,8 +1766,8 @@ HELP_TEXT = """\
   q          Quit
   r          Refresh current tab
   U          Check for updates
-  [ / ]      Previous / next tab
   ?          Show this help
+  [ / ]      Previous / next tab
 
 [b]Standup tab — time scope[/b]
   1          Today
@@ -1300,6 +1785,11 @@ HELP_TEXT = """\
   u          Unarchive the selected session (only when archived
              sessions are shown; this is a direct database write,
              since opencode's API has no unarchive endpoint yet)
+
+[b]GitHub tab[/b]
+  g          Refresh GitHub activity
+  c          Set up GitHub credentials
+  o          Open the selected pull request in a browser
 
 Press any key to close this help.
 """
@@ -1340,7 +1830,7 @@ class StandupApp(App):
     Screen {
         layout: vertical;
     }
-    #summary, #todo-summary {
+    #summary {
         height: auto;
         padding: 1 2;
         border: round $accent;
@@ -1354,7 +1844,17 @@ class StandupApp(App):
         border: round $success;
         margin: 1 2 0 2;
     }
-    #tree-container, #todo-tree-container {
+    #tree-container {
+        height: 1fr;
+        margin: 1 2;
+    }
+    #github-summary {
+        height: auto;
+        padding: 1 2;
+        border: round $accent;
+        margin: 1 2 0 2;
+    }
+    #github-tree-container {
         height: 1fr;
         margin: 1 2;
     }
@@ -1377,6 +1877,8 @@ class StandupApp(App):
         ("4", "set_scope_all", "All"),
         ("5", "set_scope_sprint", "Sprint"),
         Binding("s", "generate_summary", "Generate summary", show=False),
+        Binding("g", "refresh_github", "Refresh GitHub", show=False),
+        Binding("c", "setup_github", "Set up GitHub", show=False),
         Binding("[", "prev_tab", "Prev tab", show=False),
         Binding("]", "next_tab", "Next tab", show=False),
         Binding("question_mark", "show_help", "Help", show=False),
@@ -1389,13 +1891,21 @@ class StandupApp(App):
         self.scope = scope
         self.include_archived = False
         self.groups: list[ProjectGroup] = []
-        self.todo_groups: list[TodoProjectGroup] = []
+        self.github_activities: tuple[GitHubActivity, ...] = ()
+        self.github_available = True
+        self.github_error: str | None = None
+        self.github_loading = False
+        self.github_request_id = 0
+        self.github_worker: Worker[tuple[int, GitHubActivityResult]] | None = None
+        self.github_credentials_override: tuple[str, str] | None = None
         self.server = OpencodeServer()
         self.summary_text: str | None = None
         self.summary_error: str | None = None
         self.summary_loading = False
         self.summary_jira_available = True
         self.summary_jira_error: str | None = None
+        self.summary_github_available = True
+        self.summary_github_error: str | None = None
         self.summary_worker: Worker[tuple[int, SummaryResult]] | None = None
         self.summary_request_id = 0
         self.update_worker: Worker[UpdateInfo | None] | None = None
@@ -1410,10 +1920,10 @@ class StandupApp(App):
                 yield Static(id="summary")
                 with VerticalScroll(id="tree-container"):
                     yield Tree("opencode standup", id="report-tree")
-            with TabPane("Todo", id="todo-tab"):
-                yield Static(id="todo-summary")
-                with VerticalScroll(id="todo-tree-container"):
-                    yield Tree("open todos", id="todo-tree")
+            with TabPane("GitHub", id="github-tab"):
+                yield Static(id="github-summary")
+                with VerticalScroll(id="github-tree-container"):
+                    yield Tree("GitHub activity", id="github-tree")
         yield Footer(compact=True, show_command_palette=False)
 
     def on_mount(self) -> None:
@@ -1430,15 +1940,52 @@ class StandupApp(App):
         self._invalidate_summary()
         sessions = load_sessions(self.db_path)
         project_names = load_project_names(self.db_path)
-        todos = load_open_todos(self.db_path)
 
         self.groups = build_report(sessions, project_names, self.scope, self.include_archived)
-        self.todo_groups = build_todo_report(sessions, todos, project_names, self.include_archived)
 
         self.render_summary()
         self.render_tree()
-        self.render_todo_summary()
-        self.render_todo_tree()
+        self._start_github_activity()
+        self.render_github()
+
+    @work(thread=True, exclusive=True, group="github-activity", exit_on_error=False)
+    def _load_github_activity_worker(
+        self, request_id: int, scope: Scope, force_refresh: bool
+    ) -> tuple[int, GitHubActivityResult]:
+        return request_id, load_github_activity(
+            scope, force_refresh, self.github_credentials_override
+        )
+
+    def _start_github_activity(self, force_refresh: bool = False) -> None:
+        self.github_request_id += 1
+        self.github_loading = True
+        self.github_activities = ()
+        self.github_available = True
+        self.github_error = None
+        if self.is_mounted:
+            self.render_github()
+        self.github_worker = self._load_github_activity_worker(
+            self.github_request_id, self.scope, force_refresh
+        )
+
+    @on(Worker.StateChanged)
+    def _github_worker_changed(self, event: Worker.StateChanged) -> None:
+        if event.worker is not self.github_worker:
+            return
+        if event.state == WorkerState.SUCCESS:
+            request_id, result = event.worker.result  # type: ignore[misc]
+            if request_id != self.github_request_id:
+                return
+            self.github_activities = result.activities
+            self.github_available = result.available
+            self.github_error = result.error
+        elif event.state == WorkerState.ERROR:
+            self.github_available = False
+            self.github_error = str(event.worker.error or "GitHub activity failed.")
+        else:
+            return
+        self.github_loading = False
+        self.render_github()
 
     def _invalidate_summary(self) -> None:
         self.summary_request_id += 1
@@ -1447,6 +1994,8 @@ class StandupApp(App):
         self.summary_loading = False
         self.summary_jira_available = True
         self.summary_jira_error = None
+        self.summary_github_available = True
+        self.summary_github_error = None
         if self.is_mounted:
             self.render_ai_summary()
 
@@ -1518,6 +2067,9 @@ class StandupApp(App):
             if not self.summary_jira_available:
                 detail = self.summary_jira_error or "Jira context was unavailable."
                 note = f"\n\n> _Chat-only summary: {detail}_"
+            if not self.summary_github_available:
+                detail = self.summary_github_error or "GitHub activity was unavailable."
+                note += f"\n\n> _GitHub enrichment unavailable: {detail}_"
             widget.update(f"**AI standup summary**\n\n{self.summary_text}{note}")
         else:
             widget.update("**AI standup summary**\n\nPress `s` to generate.")
@@ -1545,6 +2097,8 @@ class StandupApp(App):
             self.summary_text = result.text
             self.summary_jira_available = result.jira_available
             self.summary_jira_error = result.jira_error
+            self.summary_github_available = result.github_available
+            self.summary_github_error = result.github_error
             self.summary_error = None
         elif event.state == WorkerState.ERROR:
             self.summary_error = str(event.worker.error or "Summary generation failed.")
@@ -1635,61 +2189,69 @@ class StandupApp(App):
                 )
                 project_node.add_leaf(task_label, data=task.root)
 
-    # -- Todo tab rendering --------------------------------------------------
-
-    def render_todo_summary(self) -> None:
-        total_items = sum(len(items) for g in self.todo_groups for _, items in g.sessions)
-        total_sessions = sum(len(g.sessions) for g in self.todo_groups)
-        widget = self.query_one("#todo-summary", Static)
-        archived_note = "  [dim](showing archived)[/dim]" if self.include_archived else ""
-        if not self.todo_groups:
-            widget.update(f"[b]Open todos[/b]{archived_note}\n\n[dim]Nothing outstanding. Nice.[/dim]")
-            return
-        widget.update(
-            f"[b]Open todos[/b]{archived_note}\n\n"
-            f"[b]{total_items}[/b] item(s) across [b]{total_sessions}[/b] session(s) "
-            f"in [b]{len(self.todo_groups)}[/b] project(s)"
-        )
-
-    def render_todo_tree(self) -> None:
-        tree = self.query_one("#todo-tree", Tree)
+    def render_github(self) -> None:
+        summary = self.query_one("#github-summary", Static)
+        tree = self.query_one("#github-tree", Tree)
         tree.clear()
         tree.root.expand()
         tree.show_root = False
-
-        for g in self.todo_groups:
-            item_count = sum(len(items) for _, items in g.sessions)
-            project_node: TreeNode = tree.root.add(
-                f"[b]{g.name}[/b]  —  {item_count} item(s)", expand=True
-            )
-            for session, items in g.sessions:
-                archived_note = " [dim](archived)[/dim]" if session.time_archived else ""
-                session_node = project_node.add(
-                    f"{session.title}{archived_note}  [dim]({fmt_date(session.time_created)})[/dim]",
-                    expand=True,
-                    data=session,
+        if self.github_loading:
+            summary.update("[b]GitHub activity[/b]\n\n[dim]Loading…[/dim]")
+            return
+        if not self.github_available:
+            detail = self.github_error or "Unavailable."
+            setup_hint = "\n\n[dim]Press `c` to connect GitHub." if "credentials" in detail.lower() else ""
+            summary.update(f"[b]GitHub activity[/b]\n\n[red]{detail}[/red]{setup_hint}")
+            return
+        summary.update(
+            f"[b]GitHub activity[/b]\n\n"
+            f"[b]{len(self.github_activities)}[/b] activity item(s) for {self.scope.label()}"
+            if self.github_activities
+            else f"[b]GitHub activity[/b]\n\n[dim]No activity for {self.scope.label()}.[/dim]"
+        )
+        labels = {
+            GitHubActivityKind.OPENED: "Opened PRs",
+            GitHubActivityKind.MERGED: "Merged PRs authored by you",
+            GitHubActivityKind.REVIEWED: "Reviewed PRs",
+            GitHubActivityKind.COMMENTED: "PR conversation comments",
+        }
+        groups: dict[GitHubActivityKind, list[GitHubActivity]] = defaultdict(list)
+        for activity in self.github_activities:
+            groups[activity.kind].append(activity)
+        for kind in GitHubActivityKind:
+            activities = groups.get(kind, [])
+            if not activities:
+                continue
+            group = tree.root.add(f"[b]{labels[kind]}[/b]  —  {len(activities)}", expand=True)
+            for activity in activities:
+                occurred = _github_iso_datetime(activity.occurred_at)
+                when = occurred.astimezone().strftime("%b %d %H:%M") if occurred else activity.occurred_at
+                detail = f" [{activity.detail}]" if activity.detail else ""
+                group.add_leaf(
+                    f"[cyan]{when}[/cyan]  {activity.repository}#{activity.number}  "
+                    f"{activity.title}{detail}",
+                    data=activity,
                 )
-                for item in items:
-                    color = PRIORITY_COLOR.get(item.priority, "white")
-                    session_node.add_leaf(
-                        f"[{color}]●[/{color}] {item.content}  [dim]({item.priority})[/dim]",
-                        data=session,
-                    )
 
     # -- helpers -------------------------------------------------------------
 
     def _active_tree(self) -> Tree:
         tabbed = self.query_one(TabbedContent)
-        if tabbed.active == "todo-tab":
-            return self.query_one("#todo-tree", Tree)
-        return self.query_one("#report-tree", Tree)
+        return self.query_one(
+            "#github-tree" if tabbed.active == "github-tab" else "#report-tree", Tree
+        )
+
+    def _selected_data(self) -> object | None:
+        node = self._active_tree().cursor_node
+        return None if node is None else node.data
 
     def _selected_session(self) -> SessionRow | None:
-        tree = self._active_tree()
-        node = tree.cursor_node
-        if node is None or node.data is None:
-            return None
-        return node.data
+        data = self._selected_data()
+        return data if isinstance(data, SessionRow) else None
+
+    def _selected_github_activity(self) -> GitHubActivity | None:
+        data = self._selected_data()
+        return data if isinstance(data, GitHubActivity) else None
 
     def _reload_scope_selector_label(self) -> None:
         # header/summary re-render already reflects scope; nothing extra needed
@@ -1733,19 +2295,59 @@ class StandupApp(App):
         self.scope = Scope(ScopeKind.SPRINT)
         self.load_and_render()
 
-    # -- actions: tabs ---------------------------------------------------------
-
-    def action_prev_tab(self) -> None:
-        tabbed = self.query_one(TabbedContent)
-        tabbed.active = "todo-tab" if tabbed.active == "standup-tab" else "standup-tab"
-
-    def action_next_tab(self) -> None:
-        self.action_prev_tab()  # only two tabs; prev/next are equivalent
-
     # -- actions: refresh / help -------------------------------------------------
 
     def action_refresh_report(self) -> None:
+        if self.query_one(TabbedContent).active == "github-tab":
+            self._start_github_activity(force_refresh=True)
+            return
         self.load_and_render()
+
+    def action_refresh_github(self) -> None:
+        self._start_github_activity(force_refresh=True)
+
+    def action_setup_github(self) -> None:
+        def handle_token(token: str | None) -> None:
+            if not token:
+                return
+            self.notify("Validating GitHub token...", timeout=5)
+            self.github_setup_worker = self._validate_github_worker(token)
+
+        self.push_screen(GitHubSetupModal(), handle_token)
+
+    @work(thread=True, exclusive=True, group="github-setup", exit_on_error=False)
+    def _validate_github_worker(self, token: str) -> tuple[bool, str, str]:
+        valid, result = validate_github_credentials(("", token))
+        return valid, result, token
+
+    @on(Worker.StateChanged)
+    def _github_setup_worker_changed(self, event: Worker.StateChanged) -> None:
+        if event.worker is not getattr(self, "github_setup_worker", None):
+            return
+        if event.state == WorkerState.SUCCESS:
+            valid, result, token = event.worker.result
+            if not valid:
+                self.notify(result, severity="error", timeout=10)
+                return
+            try:
+                save_github_credentials(result, token)
+            except OSError as exc:
+                self.notify(f"Could not save GitHub credentials: {exc}", severity="error", timeout=10)
+                return
+            self.github_credentials_override = (result, token)
+            self.notify(f"GitHub connected as {result}.", timeout=5)
+            self._start_github_activity()
+        elif event.state == WorkerState.ERROR:
+            self.notify(
+                f"GitHub setup failed: {event.worker.error}", severity="error", timeout=10
+            )
+
+    def action_prev_tab(self) -> None:
+        tabbed = self.query_one(TabbedContent)
+        tabbed.active = "github-tab" if tabbed.active == "standup-tab" else "standup-tab"
+
+    def action_next_tab(self) -> None:
+        self.action_prev_tab()
 
     def action_check_for_updates(self) -> None:
         if self.update_worker is not None and self.update_worker.is_running:
@@ -1821,6 +2423,10 @@ class StandupApp(App):
         self.load_and_render()
 
     def action_open_session(self) -> None:
+        activity = self._selected_github_activity()
+        if activity is not None:
+            webbrowser.open(activity.url)
+            return
         session = self._selected_session()
         if session is None:
             self.notify("Select a task/session first.", severity="warning")

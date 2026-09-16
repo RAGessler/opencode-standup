@@ -8,7 +8,7 @@ It provides:
 - A current sprint view for September 14 through September 25, 2026
 - An on-demand AI summary of the previous workday using OpenCode chat and Jira context
 - Cost and token rollups, including subagent spend
-- A todo view of outstanding todo items across sessions
+- A GitHub activity view for pull requests you opened, merged, reviewed, or commented on
 - Session rename, archive, unarchive, and resume actions
 
 ## Requirements
@@ -23,7 +23,9 @@ The app reads OpenCode's SQLite database directly. It also starts `opencode serv
 
 ### 1. Configure GitHub access, if needed
 
-The tool is distributed as a wheel attached to each GitHub Release. If the repository is public, no GitHub credentials are needed. If it is private, create a GitHub personal access token (classic) with repository read access and configure:
+The tool is distributed as a wheel attached to each GitHub Release. If the repository is public, no GitHub credentials are needed. For GitHub activity, launch the app, switch to the GitHub tab, and press `c` to start the guided setup. It opens GitHub's token settings, validates the token and `ShamrockTrading` organization visibility, and stores it locally with owner-only permissions.
+
+You can also configure a GitHub personal access token (classic) with repository read access using environment variables:
 
 ```bash
 export OPENCODE_STANDUP_GITHUB_USERNAME=YOUR_GITHUB_USERNAME
@@ -68,7 +70,7 @@ Add the same line to `~/.zshrc` or `~/.bashrc` to make it permanent, then open a
 opencode-standup
 ```
 
-The default view shows sessions from the previous workday. Use the keybindings below to change the time range, switch to todos, refresh, or open a session.
+The default view shows sessions from the previous workday. Use the keybindings below to change the time range, refresh, or open a session.
 
 ## Usage
 
@@ -93,7 +95,8 @@ In the TUI, press `?` for the full keybinding list. The primary bindings are:
 
 - `1` through `5`: change the standup time scope, including the current sprint
 - `s`: generate an AI summary when the selected scope is Last workday
-- `[` and `]`: switch tabs
+- `[` and `]`: switch between the Standup and GitHub tabs
+- `g`: refresh GitHub activity
 - `e`: rename the selected session
 - `x`: archive the selected session
 - `A`: show or hide archived sessions
@@ -110,6 +113,16 @@ Select a session row with the arrow keys before using an action. Rename and arch
 When the selected scope is **Last workday**, press `s` to generate a summary above the normal overview. It contains a short narrative followed by bullets for progress, Jira work, blockers or risks, and next steps. The summary is generated on demand with the provider and model already configured for `opencode`.
 
 The app sends bounded excerpts from relevant OpenCode session prompts and assistant responses, along with session metadata and Jira ticket metadata, to OpenCode. Tool output and reasoning are excluded. Jira enrichment uses the authenticated `twg` command for your Jira activity during the previous workday and is optional; if it is unavailable, the app generates a clearly labeled chat-only summary.
+
+### GitHub Activity
+
+The GitHub tab loads automatically in the background for the selected time scope. It shows pull requests you opened, pull requests you authored that were merged, pull requests you reviewed, and pull requests where you added a conversation comment in the `ShamrockTrading` organization. Inline code-review comments are represented by review activity rather than duplicated as comments. `o` opens the selected pull request in your browser and `g` refreshes the activity manually. GitHub searches return up to 100 recently updated matching pull requests per category; the All time view is also bounded to the most recent 366 days.
+
+If GitHub credentials are not configured, switch to the GitHub tab and press `c`. The guided setup opens GitHub's token settings, asks for the token, validates it against `/user`, and stores it in `$XDG_CONFIG_HOME/opencode-standup/github.json` (or `~/.config/opencode-standup/github.json`) with owner-only permissions. Environment variables and `.netrc` remain supported and take precedence over the guided setup credentials.
+
+GitHub activity uses the authenticated account returned by GitHub, not the configured username. It uses authenticated REST API searches with `OPENCODE_STANDUP_GITHUB_TOKEN` and `OPENCODE_STANDUP_GITHUB_USERNAME`, the `github.com` entry in `.netrc`, or credentials saved by the guided setup. The token must be able to read the `ShamrockTrading` repositories whose activity you want to see, including private repositories. A classic token needs the `repo` scope. A fine-grained token must be granted read access to the relevant organization repositories and pull requests. If ShamrockTrading uses SAML SSO, authorize the token for the organization in GitHub after creating it. Missing credentials, organization access, authentication errors, rate limits, and GitHub outages are shown as unavailable activity and do not block the standup view.
+
+When generating the Last workday AI summary, the app adds up to 40 GitHub activity records and 4,000 characters of GitHub metadata such as repository, pull request number, title, activity type, and URL. It never sends the GitHub token to OpenCode and does not send GitHub comment bodies.
 
 The context and process limits can be adjusted with environment variables:
 
